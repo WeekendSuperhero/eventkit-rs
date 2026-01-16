@@ -17,7 +17,7 @@
 //!     // Working with reminders
 //!     let reminders = RemindersManager::new();
 //!     reminders.request_access()?;
-//!     
+//!
 //!     for reminder in reminders.fetch_incomplete_reminders()? {
 //!         println!("Todo: {}", reminder.title);
 //!     }
@@ -25,7 +25,7 @@
 //!     // Working with calendar events
 //!     let events = EventsManager::new();
 //!     events.request_access()?;
-//!     
+//!
 //!     for event in events.fetch_today_events()? {
 //!         println!("Event: {}", event.title);
 //!     }
@@ -47,17 +47,16 @@
 //! - `NSCalendarsFullAccessUsageDescription` - for calendar access (macOS 14+)
 //! - `NSCalendarsUsageDescription` - for calendar access (older macOS)
 
-use std::sync::{Arc, Condvar, Mutex};
-
 use block2::RcBlock;
 use chrono::{DateTime, Duration, Local, TimeZone};
+use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::Bool;
-use objc2::Message;
 use objc2_event_kit::{
     EKAuthorizationStatus, EKCalendar, EKEntityType, EKEvent, EKEventStore, EKReminder, EKSpan,
 };
 use objc2_foundation::{NSArray, NSDate, NSError, NSString};
+use std::sync::{Arc, Condvar, Mutex};
 use thiserror::Error;
 
 /// Errors that can occur when working with EventKit
@@ -278,27 +277,25 @@ impl RemindersManager {
                 .predicateForRemindersInCalendars(calendars.as_deref())
         };
 
-        let result = Arc::new((
-            Mutex::new(None::<Option<Retained<NSArray<EKReminder>>>>),
-            Condvar::new(),
-        ));
+        let result = Arc::new((Mutex::new(None::<Vec<ReminderItem>>), Condvar::new()));
         let result_clone = Arc::clone(&result);
 
         let completion = RcBlock::new(move |reminders: *mut NSArray<EKReminder>| {
-            let reminders_opt = if reminders.is_null() {
-                None
+            let items = if reminders.is_null() {
+                Vec::new()
             } else {
-                Some(unsafe { Retained::retain(reminders).unwrap() })
+                let reminders = unsafe { Retained::retain(reminders).unwrap() };
+                reminders.iter().map(|r| reminder_to_item(&r)).collect()
             };
             let (lock, cvar) = &*result_clone;
             let mut guard = lock.lock().unwrap();
-            *guard = Some(reminders_opt);
+            *guard = Some(items);
             cvar.notify_one();
         });
 
         unsafe {
             self.store
-                .fetchRemindersMatchingPredicate_completion(&predicate, &*completion);
+                .fetchRemindersMatchingPredicate_completion(&predicate, &completion);
         }
 
         let (lock, cvar) = &*result;
@@ -307,17 +304,9 @@ impl RemindersManager {
             guard = cvar.wait(guard).unwrap();
         }
 
-        match guard.take() {
-            Some(Some(reminders)) => {
-                let mut items = Vec::new();
-                for reminder in reminders.iter() {
-                    items.push(reminder_to_item(&reminder));
-                }
-                Ok(items)
-            }
-            Some(None) => Ok(Vec::new()),
-            None => Err(RemindersError::FetchFailed("Unknown error".to_string())),
-        }
+        guard
+            .take()
+            .ok_or_else(|| RemindersError::FetchFailed("Unknown error".to_string()))
     }
 
     /// Fetches incomplete reminders
@@ -331,27 +320,25 @@ impl RemindersManager {
                 )
         };
 
-        let result = Arc::new((
-            Mutex::new(None::<Option<Retained<NSArray<EKReminder>>>>),
-            Condvar::new(),
-        ));
+        let result = Arc::new((Mutex::new(None::<Vec<ReminderItem>>), Condvar::new()));
         let result_clone = Arc::clone(&result);
 
         let completion = RcBlock::new(move |reminders: *mut NSArray<EKReminder>| {
-            let reminders_opt = if reminders.is_null() {
-                None
+            let items = if reminders.is_null() {
+                Vec::new()
             } else {
-                Some(unsafe { Retained::retain(reminders).unwrap() })
+                let reminders = unsafe { Retained::retain(reminders).unwrap() };
+                reminders.iter().map(|r| reminder_to_item(&r)).collect()
             };
             let (lock, cvar) = &*result_clone;
             let mut guard = lock.lock().unwrap();
-            *guard = Some(reminders_opt);
+            *guard = Some(items);
             cvar.notify_one();
         });
 
         unsafe {
             self.store
-                .fetchRemindersMatchingPredicate_completion(&predicate, &*completion);
+                .fetchRemindersMatchingPredicate_completion(&predicate, &completion);
         }
 
         let (lock, cvar) = &*result;
@@ -360,17 +347,9 @@ impl RemindersManager {
             guard = cvar.wait(guard).unwrap();
         }
 
-        match guard.take() {
-            Some(Some(reminders)) => {
-                let mut items = Vec::new();
-                for reminder in reminders.iter() {
-                    items.push(reminder_to_item(&reminder));
-                }
-                Ok(items)
-            }
-            Some(None) => Ok(Vec::new()),
-            None => Err(RemindersError::FetchFailed("Unknown error".to_string())),
-        }
+        guard
+            .take()
+            .ok_or_else(|| RemindersError::FetchFailed("Unknown error".to_string()))
     }
 
     /// Creates a new reminder
@@ -819,6 +798,7 @@ impl EventsManager {
     }
 
     /// Creates a new event
+    #[allow(clippy::too_many_arguments)]
     pub fn create_event(
         &self,
         title: &str,
@@ -990,8 +970,11 @@ fn event_to_item(event: &EKEvent) -> EventItem {
     let all_day = unsafe { event.isAllDay() };
     let calendar_title = unsafe { event.calendar() }.map(|c| unsafe { c.title() }.to_string());
 
-    let start_date = nsdate_to_datetime(unsafe { &event.startDate() });
-    let end_date = nsdate_to_datetime(unsafe { &event.endDate() });
+    let start_ns: Retained<NSDate> = unsafe { event.startDate() };
+    let end_ns: Retained<NSDate> = unsafe { event.endDate() };
+
+    let start_date = nsdate_to_datetime(&start_ns);
+    let end_date = nsdate_to_datetime(&end_ns);
 
     EventItem {
         identifier,

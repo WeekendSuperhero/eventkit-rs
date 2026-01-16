@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2024-XX-XX
 
 ### Added
+
 - Initial release
 - `RemindersManager` for full CRUD operations on macOS Reminders
   - Create, read, update, delete reminders
@@ -31,9 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MIT License
 
 ### Known Limitations
+
 - macOS only (10.14+)
 - Recurring events show as individual occurrences
 - No support for event invitations/attendees management
 
-[Unreleased]: https://github.com/yourusername/eventkit-rs/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/yourusername/eventkit-rs/releases/tag/v0.1.0
+[Unreleased]: https://github.com/weekendsuperhero/eventkit-rs/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/weekendsuperhero/eventkit-rs/releases/tag/v0.1.0

@@ -438,13 +438,13 @@ fn cmd_reminders_add(
     list: Option<&str>,
     priority: Option<usize>,
 ) -> Result<(), EventKitError> {
-    if let Some(p) = priority {
-        if p > 9 {
-            eprintln!("Priority must be between 0 and 9");
-            return Err(EventKitError::SaveFailed(
-                "Invalid priority value".to_string(),
-            ));
-        }
+    if let Some(p) = priority
+        && p > 9
+    {
+        eprintln!("Priority must be between 0 and 9");
+        return Err(EventKitError::SaveFailed(
+            "Invalid priority value".to_string(),
+        ));
     }
 
     let manager = RemindersManager::new();
@@ -470,13 +470,13 @@ fn cmd_reminders_update(
         return Ok(());
     }
 
-    if let Some(p) = priority {
-        if p > 9 {
-            eprintln!("Priority must be between 0 and 9");
-            return Err(EventKitError::SaveFailed(
-                "Invalid priority value".to_string(),
-            ));
-        }
+    if let Some(p) = priority
+        && p > 9
+    {
+        eprintln!("Priority must be between 0 and 9");
+        return Err(EventKitError::SaveFailed(
+            "Invalid priority value".to_string(),
+        ));
     }
 
     let manager = RemindersManager::new();

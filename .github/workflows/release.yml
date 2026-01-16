@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,22 +16,22 @@ jobs:
     name: Validate Release
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v6
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      
+
       - name: Check formatting
         run: cargo fmt --all -- --check
-      
+
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
-      
+
       - name: Run tests
         run: cargo test --all-features
-      
+
       - name: Build release
         run: cargo build --release --all-features
 
@@ -40,15 +40,15 @@ jobs:
     needs: validate
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v6
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-action@stable
-      
+        uses: dtolnay/rust-toolchain@1.92
+
       - name: Publish to crates.io
-        run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   create-release:
     name: Create GitHub Release
@@ -56,38 +56,38 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchaine@1.92
         with:
           targets: x86_64-apple-darwin,aarch64-apple-darwin
-      
+
       - name: Build for x86_64
         run: |
           cargo build --release --target x86_64-apple-darwin
           mv target/x86_64-apple-darwin/release/eventkit eventkit-x86_64-apple-darwin
-      
+
       - name: Build for aarch64
         run: |
           cargo build --release --target aarch64-apple-darwin
           mv target/aarch64-apple-darwin/release/eventkit eventkit-aarch64-apple-darwin
-      
+
       - name: Create universal binary
         run: |
           lipo -create -output eventkit-universal-apple-darwin \
             eventkit-x86_64-apple-darwin \
             eventkit-aarch64-apple-darwin
-      
+
       - name: Compress binaries
         run: |
           tar -czvf eventkit-x86_64-apple-darwin.tar.gz eventkit-x86_64-apple-darwin
           tar -czvf eventkit-aarch64-apple-darwin.tar.gz eventkit-aarch64-apple-darwin
           tar -czvf eventkit-universal-apple-darwin.tar.gz eventkit-universal-apple-darwin
-      
+
       - name: Get version from tag
         id: get_version
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-      
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:

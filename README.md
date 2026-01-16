@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/eventkit-rs.svg)](https://crates.io/crates/eventkit-rs)
 [![Documentation](https://docs.rs/eventkit-rs/badge.svg)](https://docs.rs/eventkit-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![CI](https://github.com/yourusername/eventkit-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/eventkit-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/weekendsuperhero/eventkit-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/weekendsuperhero/eventkit-rs/actions/workflows/ci.yml)
 
 A Rust library and CLI for interacting with macOS Calendar events and Reminders via Apple's EventKit framework.
 
@@ -42,10 +42,10 @@ use eventkit::{RemindersManager, EventsManager, Result};
 fn main() -> Result<()> {
     // === Working with Reminders ===
     let reminders = RemindersManager::new();
-    
+
     // Request access (required on first use)
     reminders.request_access()?;
-    
+
     // Create a reminder
     let reminder = reminders.create_reminder(
         "Buy groceries",
@@ -54,29 +54,29 @@ fn main() -> Result<()> {
         Some(1),  // High priority
     )?;
     println!("Created: {}", reminder.title);
-    
+
     // List incomplete reminders
     for item in reminders.fetch_incomplete_reminders()? {
         println!("- {} ({})", item.title, if item.completed { "✓" } else { "○" });
     }
-    
+
     // Complete a reminder
     reminders.complete_reminder(&reminder.identifier)?;
-    
+
     // === Working with Calendar Events ===
     let events = EventsManager::new();
     events.request_access()?;
-    
+
     // List today's events
     for event in events.fetch_today_events()? {
         println!("📅 {} at {}", event.title, event.start_date);
     }
-    
+
     // Create an event
     use chrono::{Local, Duration};
     let start = Local::now() + Duration::hours(1);
     let end = start + Duration::hours(2);
-    
+
     let event = events.create_event(
         "Team Meeting",
         start,
@@ -86,7 +86,7 @@ fn main() -> Result<()> {
         None,  // Use default calendar
         false, // Not all-day
     )?;
-    
+
     Ok(())
 }
 ```
@@ -160,6 +160,7 @@ eventkit events delete <id> --force
 ## Platform Support
 
 This library only works on **macOS**. It requires:
+
 - macOS 10.14 (Mojave) or later
 - Rust 1.70 or later
 
@@ -185,35 +186,35 @@ Your application needs to request permission to access Calendar and/or Reminders
 
 ### RemindersManager
 
-| Method | Description |
-|--------|-------------|
-| `new()` | Create a new manager |
-| `authorization_status()` | Check current auth status |
-| `request_access()` | Request reminders permission |
-| `list_calendars()` | List all reminder lists |
-| `fetch_all_reminders()` | Fetch all reminders |
-| `fetch_incomplete_reminders()` | Fetch incomplete reminders |
-| `fetch_reminders(calendars)` | Fetch from specific lists |
-| `create_reminder(...)` | Create a new reminder |
-| `update_reminder(...)` | Update an existing reminder |
-| `complete_reminder(id)` | Mark as complete |
-| `uncomplete_reminder(id)` | Mark as incomplete |
-| `delete_reminder(id)` | Delete a reminder |
+| Method                         | Description                  |
+| ------------------------------ | ---------------------------- |
+| `new()`                        | Create a new manager         |
+| `authorization_status()`       | Check current auth status    |
+| `request_access()`             | Request reminders permission |
+| `list_calendars()`             | List all reminder lists      |
+| `fetch_all_reminders()`        | Fetch all reminders          |
+| `fetch_incomplete_reminders()` | Fetch incomplete reminders   |
+| `fetch_reminders(calendars)`   | Fetch from specific lists    |
+| `create_reminder(...)`         | Create a new reminder        |
+| `update_reminder(...)`         | Update an existing reminder  |
+| `complete_reminder(id)`        | Mark as complete             |
+| `uncomplete_reminder(id)`      | Mark as incomplete           |
+| `delete_reminder(id)`          | Delete a reminder            |
 
 ### EventsManager
 
-| Method | Description |
-|--------|-------------|
-| `new()` | Create a new manager |
-| `authorization_status()` | Check current auth status |
-| `request_access()` | Request calendar permission |
-| `list_calendars()` | List all calendars |
-| `fetch_today_events()` | Fetch today's events |
-| `fetch_upcoming_events(days)` | Fetch next N days |
-| `fetch_events(start, end, calendars)` | Fetch in date range |
-| `create_event(...)` | Create a new event |
-| `update_event(...)` | Update an existing event |
-| `delete_event(id)` | Delete an event |
+| Method                                | Description                 |
+| ------------------------------------- | --------------------------- |
+| `new()`                               | Create a new manager        |
+| `authorization_status()`              | Check current auth status   |
+| `request_access()`                    | Request calendar permission |
+| `list_calendars()`                    | List all calendars          |
+| `fetch_today_events()`                | Fetch today's events        |
+| `fetch_upcoming_events(days)`         | Fetch next N days           |
+| `fetch_events(start, end, calendars)` | Fetch in date range         |
+| `create_event(...)`                   | Create a new event          |
+| `update_event(...)`                   | Update an existing event    |
+| `delete_event(id)`                    | Delete an event             |
 
 ## Examples
 

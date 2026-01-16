@@ -17,17 +17,20 @@ Please be respectful and constructive in all interactions. We want this to be a 
 ### Setting Up Development Environment
 
 1. Clone the repository:
+
    ```bash
-   git clone https://github.com/yourusername/eventkit-rs.git
+   git clone https://github.com/weekendsuperhero/eventkit-rs.git
    cd eventkit-rs
    ```
 
 2. Build the project:
+
    ```bash
    cargo build
    ```
 
 3. Run tests:
+
    ```bash
    cargo test
    ```
@@ -130,6 +133,7 @@ Releases are managed by maintainers. The process is:
 ## Questions?
 
 If you have questions, feel free to:
+
 - Open an issue for discussion
 - Check existing issues and PRs
 

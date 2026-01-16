@@ -1,17 +1,17 @@
 [package]
 name = "eventkit-rs"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "A Rust library and CLI for managing macOS Calendar events and Reminders via EventKit"
 license = "MIT"
-repository = "https://github.com/yourusername/eventkit-rs"
+repository = "https://github.com/weekendsuperhero/eventkit-rs"
 documentation = "https://docs.rs/eventkit-rs"
-homepage = "https://github.com/yourusername/eventkit-rs"
+homepage = "https://github.com/weekendsuperhero/eventkit-rs"
 readme = "README.md"
 keywords = ["macos", "calendar", "reminders", "eventkit", "apple"]
 categories = ["api-bindings", "os::macos-apis"]
-authors = ["Your Name <your@email.com>"]
-rust-version = "1.70"
+authors = ["WeekendSuperhero <weekend@weekendsuperhero.io>"]
+rust-version = "1.92"
 
 [[bin]]
 name = "eventkit"
@@ -26,7 +26,7 @@ objc2 = "0.6"
 objc2-event-kit = { version = "0.3.2", features = [
     "EKEventStore",
     "EKEvent",
-    "EKReminder", 
+    "EKReminder",
     "EKCalendar",
     "EKCalendarItem",
     "EKObject",
