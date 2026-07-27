@@ -5,10 +5,13 @@
 //!
 //! This module is gated behind the `mcp` feature flag.
 
+// `RoleServer` / `service::RequestContext` are NOT imported: since rmcp-macros
+// 2.x (#866) the `#[prompt_handler]` / `#[tool_handler]` expansions name those
+// types with fully qualified paths, so they no longer have to be in scope.
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServiceExt, handler::server::wrapper::Parameters, model::*,
-    prompt, prompt_handler, prompt_router, schemars, schemars::JsonSchema, service::RequestContext,
-    tool, tool_handler, tool_router, transport::stdio,
+    ErrorData as McpError, ServiceExt, handler::server::wrapper::Parameters, model::*, prompt,
+    prompt_handler, prompt_router, schemars, schemars::JsonSchema, tool, tool_handler, tool_router,
+    transport::stdio,
 };
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +40,17 @@ fn mcp_err(e: &crate::EventKitError) -> McpError {
         }
         AuthorizationRestricted => {
             "Reminders/Calendar access is restricted by system policy (MDM or parental controls)."
+                .to_string()
+        }
+        AuthorizationWriteOnly => {
+            // NAME FULL ACCESS explicitly. "Denied" would send the user to the
+            // wrong remedy: they DID grant something, just not enough. Apple
+            // returns no events at all to a write-only client, so without this
+            // error the tool would have answered with an empty calendar.
+            "Only WRITE-ONLY Calendar access was granted, which cannot read anything — \
+             Apple returns no events to a write-only client, not even ones this app created. \
+             Open System Settings → Privacy & Security → Calendars and grant FULL access \
+             for `eventkit`. Call `auth_status` to see the current state."
                 .to_string()
         }
         AuthorizationNotDetermined => {
@@ -224,18 +238,21 @@ fn auth_status_str(s: AuthorizationStatus) -> &'static str {
 }
 
 fn auth_remediation(reminders: AuthorizationStatus, events: AuthorizationStatus) -> Option<String> {
-    let granted = |s| {
-        matches!(
-            s,
-            AuthorizationStatus::FullAccess | AuthorizationStatus::WriteOnly
-        )
-    };
+    // ONLY FullAccess counts as granted. `WriteOnly` used to be treated as
+    // granted here, which meant a write-only user was told everything was
+    // fine while every read silently returned nothing — the same defect as
+    // the old `WriteOnly => Ok(())` in `ensure_authorized`, surfacing at the
+    // `auth_status` tool instead of the read path.
+    let granted = |s| matches!(s, AuthorizationStatus::FullAccess);
     if granted(reminders) && granted(events) {
         return None;
     }
     let worst = |s| match s {
-        AuthorizationStatus::Denied => 3,
-        AuthorizationStatus::Restricted => 2,
+        AuthorizationStatus::Denied => 4,
+        AuthorizationStatus::Restricted => 3,
+        // Above NotDetermined: the user already engaged with the prompt, so
+        // the actionable fix is a specific Settings change, not "try again".
+        AuthorizationStatus::WriteOnly => 2,
         AuthorizationStatus::NotDetermined => 1,
         _ => 0,
     };
@@ -263,7 +280,14 @@ fn auth_remediation(reminders: AuthorizationStatus, events: AuthorizationStatus)
              override this from System Settings — an administrator must change the policy."
                 .into()
         }
-        _ => "Authorization is partially granted; one of reminders/events is not in FullAccess/WriteOnly state.".into(),
+        AuthorizationStatus::WriteOnly => {
+            "Only WRITE-ONLY access was granted. Apple returns no events or reminders at all \
+             to a write-only client, so reads would come back empty rather than fail. Open \
+             System Settings → Privacy & Security → Calendars (and/or Reminders) and grant \
+             FULL access for `eventkit`."
+                .into()
+        }
+        _ => "Authorization is partially granted; one of reminders/events is not in FullAccess state.".into(),
     })
 }
 
@@ -1674,10 +1698,7 @@ impl EventKitServer {
         Parameters(params): Parameters<SetReminderDueTimezoneRequest>,
     ) -> Result<Json<ReminderOutput>, McpError> {
         let manager = RemindersManager::new();
-        let tz = params
-            .timezone
-            .as_deref()
-            .and_then(|t| if t.is_empty() { None } else { Some(t) });
+        let tz = params.timezone.as_deref().filter(|t| !t.is_empty());
         manager
             .set_due_date_timezone(&params.reminder_id, tz)
             .map_err(|e| mcp_err(&e))?;
@@ -2524,7 +2545,7 @@ impl EventKitServer {
         }
 
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!(
                 "Here are the current incomplete reminders:\n\n{output}\n\nPlease help me manage these reminders."
             ),
@@ -2553,7 +2574,7 @@ impl EventKitServer {
         }
 
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!(
                 "Here are the available reminder lists:\n\n{output}\n\nWhich list would you like to work with?"
             ),
@@ -2593,7 +2614,7 @@ impl EventKitServer {
                     },
                 ) {
                     Ok(updated) => Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                        PromptMessageRole::User,
+                        Role::User,
                         format!(
                             "Moved reminder \"{}\" to list \"{}\".",
                             updated.title, dest_list.title
@@ -2601,7 +2622,7 @@ impl EventKitServer {
                     )])
                     .with_description("Reminder moved")),
                     Err(e) => Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                        PromptMessageRole::User,
+                        Role::User,
                         format!("Failed to move reminder: {e}"),
                     )])
                     .with_description("Move failed")),
@@ -2610,7 +2631,7 @@ impl EventKitServer {
             None => {
                 let available: Vec<&str> = lists.iter().map(|l| l.title.as_str()).collect();
                 Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                    PromptMessageRole::User,
+                    Role::User,
                     format!(
                         "Could not find reminder list \"{}\". Available lists: {}",
                         args.destination_list,
@@ -2663,14 +2684,13 @@ impl EventKitServer {
                     details.push_str(&format!("\nList: {list}"));
                 }
 
-                Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                    PromptMessageRole::User,
-                    details,
-                )])
-                .with_description("Reminder created"))
+                Ok(
+                    GetPromptResult::new(vec![PromptMessage::new_text(Role::User, details)])
+                        .with_description("Reminder created"),
+                )
             }
             Err(e) => Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 format!("Failed to create reminder: {e}"),
             )])
             .with_description("Creation failed")),
@@ -2756,6 +2776,16 @@ pub fn dump_reminder_raw(id: &str, read_values: bool) -> Result<String, crate::E
 pub fn dump_reminder_private(id: &str) -> Result<String, crate::EventKitError> {
     let manager = RemindersManager::new();
     manager.dump_reminder_private(id)
+}
+
+/// Probe suspected-private selectors on an EVENT. Read-only, exception-safe.
+///
+/// Same probe list as `dump_reminder_private`, so a rich-notes finding on
+/// either EKReminder or EKEvent shows up in both reports. `notes` is included
+/// as a baseline — compare its reported CLASS against any attributed-notes hit.
+pub fn dump_event_private(id: &str) -> Result<String, crate::EventKitError> {
+    let manager = EventsManager::new();
+    manager.dump_event_private(id)
 }
 
 /// Dump all reminders as pretty JSON (summary mode — no alarm/recurrence fetch).
@@ -2905,21 +2935,45 @@ mod tests {
         }
     }
 
+    /// Only FULL access on BOTH entities means "nothing to fix".
     #[test]
-    fn auth_remediation_absent_when_both_granted() {
-        for r in [
-            AuthorizationStatus::FullAccess,
-            AuthorizationStatus::WriteOnly,
-        ] {
-            for e in [
+    fn auth_remediation_absent_only_when_both_have_full_access() {
+        assert!(
+            auth_remediation(
+                AuthorizationStatus::FullAccess,
+                AuthorizationStatus::FullAccess
+            )
+            .is_none(),
+            "full access on both needs no remediation"
+        );
+    }
+
+    /// Regression guard for the `auth_status` half of the write-only defect:
+    /// a write-only grant MUST still produce a remediation hint. Treating it
+    /// as granted told the user everything was fine while every read came
+    /// back silently empty.
+    #[test]
+    fn auth_remediation_present_for_write_only() {
+        for (r, e) in [
+            (
+                AuthorizationStatus::WriteOnly,
+                AuthorizationStatus::WriteOnly,
+            ),
+            (
+                AuthorizationStatus::WriteOnly,
+                AuthorizationStatus::FullAccess,
+            ),
+            (
                 AuthorizationStatus::FullAccess,
                 AuthorizationStatus::WriteOnly,
-            ] {
-                assert!(
-                    auth_remediation(r, e).is_none(),
-                    "expected no remediation for ({r:?}, {e:?})"
-                );
-            }
+            ),
+        ] {
+            let hint = auth_remediation(r, e)
+                .unwrap_or_else(|| panic!("write-only must produce a hint for ({r:?}, {e:?})"));
+            assert!(
+                hint.to_lowercase().contains("full"),
+                "the hint must name FULL access, got: {hint}"
+            );
         }
     }
 

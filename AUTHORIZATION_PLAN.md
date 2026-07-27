@@ -1,8 +1,99 @@
 # EventKit authorization — two coupled fixes
 
-**Status: planned, not started.** Found during the 2026-07-25 macOS entitlements sweep in
+**Status: IMPLEMENTED 2026-07-26.** Found during the 2026-07-25 macOS entitlements sweep in
 the consuming app. `eventkit-rs` is excluded from that workspace (root `Cargo.toml`) and
-published separately, so this is its own change + release (currently v0.5.6).
+published separately, so this is its own change + release (was v0.5.6 when planned).
+
+## What shipped, and where it deviated
+
+All three steps landed. Two deviations from the plan as written, both forced by facts the
+plan didn't have:
+
+1. **The seam is a pure function, not a trait.** The plan proposed
+   `trait AuthorizationSource { fn status(&self, entity) -> AuthorizationStatus }`. Shipped
+   instead: `authorization_verdict(need: AccessNeed, status: AuthorizationStatus) -> AuthVerdict`,
+   which takes the status as a PARAMETER. Same goal — tests drive all five statuses with no
+   EventKit and no dependence on the host's TCC state — but strictly simpler: a trait would
+   still have needed a manager (and therefore a real `EKEventStore`) to exercise the
+   `ensure_*` path, whereas the pure function needs nothing. `AuthRefusal` carries WHY a
+   check refused so the three refusals stay distinct errors.
+
+2. **The store cache is THREAD-LOCAL, not a `OnceLock` singleton, and lives inside `new()`.**
+   The plan flagged the `!Send + !Sync` constraint but not its consequence:
+   `mcp.rs::EventKitServer` documents a load-bearing invariant — handlers keep EventKit
+   values stack-local and never hold one across an `.await`, which is what makes the
+   generated futures `Send` and lets the server run on a normal multi-thread tokio runtime
+   *without rmcp's `local` feature*. Caching a store in the server struct would have broken
+   that and rippled into the consuming app. A `OnceLock` global is impossible for the same
+   `!Send + !Sync` reason. Thread-local caching preserves the invariant (one store per worker
+   thread instead of one per call), and putting the lookup inside `RemindersManager::new()` /
+   `EventsManager::new()` meant **zero call-site changes** at the ~68 construction sites —
+   `Retained` clone is a cheap retain.
+
+### Incident: the optional item caused a live outage (2026-07-26)
+
+The plan's optional third item — "also honour `EKEventStoreChanged`" — was
+implemented as a cheaper store-identity check, because the notification is
+posted on the main actor and a headless MCP server has no runloop. That check
+called `EKEventStore.eventStoreIdentifier()` inside `StoreCache::build`, which
+runs on every `Manager::new()`.
+
+`objc2` declares that accessor as returning a non-null `Retained<NSString>`.
+EventKit returns **NULL** to a process that has not been authorized yet, so
+objc2 aborted the thread:
+
+```
+PANIC on thread 'tokio-rt-worker' at objc2-event-kit-0.3.2/.../EKEventStore.rs:71:5:
+unexpected NULL returned from -[EKEventStore eventStoreIdentifier]
+```
+
+The panic landed BEFORE `ensure_full_access`, so `request_access()` never ran
+and **the TCC consent dialog never appeared**. From the outside the reminders
+tools simply did nothing, with no permission prompt and no error — the exact
+failure mode this whole plan exists to prevent, reintroduced by its own optional
+extra.
+
+It was invisible to every test because the dev host had already granted access,
+so the accessor returned non-null there. It only reproduced in the app bundle,
+which has a separate (ungranted) TCC identity.
+
+**Resolution: the identity check was removed, not patched.** It guarded a
+hypothesis (a recreated calendar database) that was never demonstrated to
+matter, and the live test in `tests/live_eventkit_store_cache.rs` had already
+shown a cached store observes external writes fine. `StoreCache::build` is now
+inert — it constructs the store and nothing else — with the rule documented on
+it and a regression test (`constructing_a_manager_touches_no_eventkit_accessor`).
+
+**The general rule this establishes:** never call an EventKit accessor on a path
+that runs before authorization. `objc2`'s non-null bindings turn "unauthorized"
+into a thread abort, and an abort before `ensure_*` silently suppresses the
+consent prompt.
+
+Two things the plan didn't anticipate:
+
+- **The same write-only bug existed a second time, at the MCP layer.** `mcp.rs::auth_remediation`
+  counted `WriteOnly` as granted, so `auth_status` told a write-only user everything was fine
+  while every read came back silently empty. Fixed with the same rule (only `FullAccess` is
+  granted) and its own regression test.
+- **`app.rs`'s "20 constructions" overstates its own cost** — it is CLI dispatch, so only one
+  runs per invocation. The real hot path was `mcp.rs`, which built a manager per tool call
+  (48 sites). Both benefit from the cache regardless.
+
+Also fixed while here: `ci-check.sh` had been failing on pre-existing lints unrelated to
+this plan. The blocking-bridge lock pairs (`Mutex` + `Condvar`, four of them, used to wait
+on Obj-C completion blocks) moved from `std::sync` to `parking_lot`, which is what the
+repo's `clippy.toml` actually prescribes — it names `std::sync::Condvar` interop as the one
+legitimate std-Mutex use and then says to *"pair parking_lot::Condvar with parking_lot::Mutex
+instead"*. Beyond the lint this is a real fix: `std::sync::Mutex` POISONS, so a panic inside
+a completion block while holding the lock would make every subsequent `lock()` panic and
+permanently brick the manager, rather than failing one call. parking_lot doesn't poison,
+which also removed eight `.unwrap()`s. It was already in the tree via tokio, so the direct
+dependency adds no compile unit. One unrelated `manual_filter` fixed too. `ci-check.sh` is
+now green with no lint suppressions.
+
+---
+
+## Original plan follows
 
 Two defects, and they **must land together** — fixing the second without the first
 introduces a regression. Neither is an entitlement problem: the entitlement

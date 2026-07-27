@@ -373,6 +373,15 @@ enum DumpCommands {
         /// Identifier of the reminder
         id: String,
     },
+    /// Probe suspected-private selectors on an EVENT, reporting the ObjC
+    /// CLASS of each value. Use this to settle whether a private rich-notes
+    /// property exists: `notes` is probed as a baseline (expect
+    /// `__NSCFString`), so anything answering with `NSAttributedString` or
+    /// RTF-bearing `NSData` would mean rich text is reachable.
+    EventPrivate {
+        /// Identifier of the event
+        id: String,
+    },
     /// Dump all reminders in a list (or all lists) as JSON
     Reminders {
         /// Filter to a specific list name
@@ -1424,6 +1433,7 @@ fn cmd_dump(cmd: DumpCommands) -> Result<(), EventKitError> {
         DumpCommands::Reminder { id } => eventkit::mcp::dump_reminder(&id)?,
         DumpCommands::ReminderRaw { id, values } => eventkit::mcp::dump_reminder_raw(&id, values)?,
         DumpCommands::ReminderPrivate { id } => eventkit::mcp::dump_reminder_private(&id)?,
+        DumpCommands::EventPrivate { id } => eventkit::mcp::dump_event_private(&id)?,
         DumpCommands::Reminders { list } => eventkit::mcp::dump_reminders(list.as_deref())?,
         DumpCommands::Event { id } => eventkit::mcp::dump_event(&id)?,
         DumpCommands::Events { days } => eventkit::mcp::dump_events(days)?,
