@@ -1271,7 +1271,12 @@ impl EventKitServer {
     // ========================================================================
 
     #[tool(
-        description = "Check macOS permission status for Reminders and Calendar without requesting access. Use this to diagnose authorization problems before calling other tools — it never triggers a consent dialog."
+        description = "Check macOS permission status for Reminders and Calendar without requesting access. Use this to diagnose authorization problems before calling other tools — it never triggers a consent dialog.",
+        annotations(
+            title = "Check Authorization Status",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn auth_status(&self) -> Result<Json<AuthStatusOutput>, McpError> {
         let reminders = RemindersManager::authorization_status();
@@ -1284,7 +1289,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Trigger the macOS consent dialog for Reminders or Calendar access. The first call shows the system prompt; subsequent calls return the cached status. Blocks until the user responds. Use `entity` = \"reminder\" or \"event\"."
+        description = "Trigger the macOS consent dialog for Reminders or Calendar access. The first call shows the system prompt; subsequent calls return the cached status. Blocks until the user responds. Use `entity` = \"reminder\" or \"event\".",
+        annotations(
+            title = "Request Access",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn request_access(
         &self,
@@ -1314,7 +1326,14 @@ impl EventKitServer {
     // Reminders Tools
     // ========================================================================
 
-    #[tool(description = "List all reminder lists (calendars) available in macOS Reminders.")]
+    #[tool(
+        description = "List all reminder lists (calendars) available in macOS Reminders.",
+        annotations(
+            title = "List Reminder Lists",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn list_reminder_lists(&self) -> Result<Json<ListResponse<CalendarOutput>>, McpError> {
         let manager = RemindersManager::new();
         match manager.list_calendars() {
@@ -1330,7 +1349,12 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "List reminders from macOS Reminders app. Filters: `show_completed` toggles inclusion of completed items; `list_name` restricts to one list; `due_after`/`due_before` window incomplete reminders by their due date; `completed_after`/`completed_before` window completed reminders by their completion date. When any `completed_*` filter is supplied, results are completed-only regardless of `show_completed`."
+        description = "List reminders from macOS Reminders app. Filters: `show_completed` toggles inclusion of completed items; `list_name` restricts to one list; `due_after`/`due_before` window incomplete reminders by their due date; `completed_after`/`completed_before` window completed reminders by their completion date. When any `completed_*` filter is supplied, results are completed-only regardless of `show_completed`.",
+        annotations(
+            title = "List Reminders",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn list_reminders(
         &self,
@@ -1395,7 +1419,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Create a new reminder in macOS Reminders. You MUST specify which list to add it to (use list_reminder_lists first to see available lists). Inline configuration: alarms (time-based or proximity-based via `geofence`), recurrence, due/start dates, IANA timezone for the due date. NB: `URL`, free-text `location`, and `structured_location` are intentionally absent on the reminder surface — iCloud Reminders silently drops those mutations. Use `set_reminder_geofence` for location-based reminders (the iCloud-honored path); for events those fields are first-class via `create_event`. Tags (the Reminders.app Tag Sidebar) are an iCloud server-side feature not reachable through EventKit at all."
+        description = "Create a new reminder in macOS Reminders. You MUST specify which list to add it to (use list_reminder_lists first to see available lists). Inline configuration: alarms (time-based or proximity-based via `geofence`), recurrence, due/start dates, IANA timezone for the due date. NB: `URL`, free-text `location`, and `structured_location` are intentionally absent on the reminder surface — iCloud Reminders silently drops those mutations. Use `set_reminder_geofence` for location-based reminders (the iCloud-honored path); for events those fields are first-class via `create_event`. Tags (the Reminders.app Tag Sidebar) are an iCloud server-side feature not reachable through EventKit at all.",
+        annotations(
+            title = "Create Reminder",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn create_reminder(
         &self,
@@ -1481,7 +1512,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Update an existing reminder. All fields are optional; only the ones you supply are written. Inline edits: title, notes, completed, priority, due/start date (empty string clears), due-date IANA timezone (empty string clears), completion_date (empty string clears and marks incomplete), alarms (replaces all when supplied), recurrence, list move. NB: `URL`/`location`/`structured_location` are absent — see `create_reminder`."
+        description = "Update an existing reminder. All fields are optional; only the ones you supply are written. Inline edits: title, notes, completed, priority, due/start date (empty string clears), due-date IANA timezone (empty string clears), completion_date (empty string clears and marks incomplete), alarms (replaces all when supplied), recurrence, list move. NB: `URL`/`location`/`structured_location` are absent — see `create_reminder`.",
+        annotations(
+            title = "Update Reminder",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn update_reminder(
         &self,
@@ -1578,7 +1616,16 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Create a new reminder list (calendar for reminders).")]
+    #[tool(
+        description = "Create a new reminder list (calendar for reminders).",
+        annotations(
+            title = "Create Reminder List",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn create_reminder_list(
         &self,
         Parameters(params): Parameters<CreateReminderListRequest>,
@@ -1590,7 +1637,16 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Update a reminder list — change name and/or color.")]
+    #[tool(
+        description = "Update a reminder list — change name and/or color.",
+        annotations(
+            title = "Update Reminder List",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn update_reminder_list(
         &self,
         Parameters(params): Parameters<UpdateReminderListRequest>,
@@ -1604,7 +1660,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Delete a reminder list. WARNING: This will delete all reminders in the list!"
+        description = "Delete a reminder list. WARNING: This will delete all reminders in the list!",
+        annotations(
+            title = "Delete Reminder List",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn delete_reminder_list(
         &self,
@@ -1617,7 +1680,16 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Mark a reminder as completed.")]
+    #[tool(
+        description = "Mark a reminder as completed.",
+        annotations(
+            title = "Complete Reminder",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn complete_reminder(
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
@@ -1635,7 +1707,16 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Mark a reminder as not completed (uncomplete it).")]
+    #[tool(
+        description = "Mark a reminder as not completed (uncomplete it).",
+        annotations(
+            title = "Uncomplete Reminder",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn uncomplete_reminder(
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
@@ -1653,7 +1734,10 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Get a single reminder by its unique identifier.")]
+    #[tool(
+        description = "Get a single reminder by its unique identifier.",
+        annotations(title = "Get Reminder", read_only_hint = true, open_world_hint = false)
+    )]
     async fn get_reminder(
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
@@ -1665,7 +1749,16 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Delete a reminder from macOS Reminders.")]
+    #[tool(
+        description = "Delete a reminder from macOS Reminders.",
+        annotations(
+            title = "Delete Reminder",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn delete_reminder(
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
@@ -1691,7 +1784,14 @@ impl EventKitServer {
     // ------------------------------------------------------------------------
 
     #[tool(
-        description = "Set or clear the timezone applied specifically to the reminder's due date (separate from the item-level timezone). Use an IANA zone like \"America/Los_Angeles\". Pass `timezone: null` or `\"\"` to clear."
+        description = "Set or clear the timezone applied specifically to the reminder's due date (separate from the item-level timezone). Use an IANA zone like \"America/Los_Angeles\". Pass `timezone: null` or `\"\"` to clear.",
+        annotations(
+            title = "Set Reminder Due Timezone",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn set_reminder_due_timezone(
         &self,
@@ -1709,7 +1809,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Attach (or clear) a geofence on a reminder. Implemented as a location-based alarm — \"remind me when I arrive at/leave this place\". Triggers a Location permission prompt the first time. Omit `geofence` to clear any existing geofence."
+        description = "Attach (or clear) a geofence on a reminder. Implemented as a location-based alarm — \"remind me when I arrive at/leave this place\". Triggers a Location permission prompt the first time. Omit `geofence` to clear any existing geofence.",
+        annotations(
+            title = "Set Reminder Geofence",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn set_reminder_geofence(
         &self,
@@ -1745,7 +1852,14 @@ impl EventKitServer {
     // Calendar/Events Tools
     // ========================================================================
 
-    #[tool(description = "List all calendars available in macOS Calendar app.")]
+    #[tool(
+        description = "List all calendars available in macOS Calendar app.",
+        annotations(
+            title = "List Calendars",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn list_calendars(&self) -> Result<Json<ListResponse<CalendarOutput>>, McpError> {
         let manager = EventsManager::new();
         match manager.list_calendars() {
@@ -1761,7 +1875,12 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Return the calendar that will be used by `create_event` when no `calendar_name` is supplied. Mirrors `EKEventStore.defaultCalendarForNewEvents`."
+        description = "Return the calendar that will be used by `create_event` when no `calendar_name` is supplied. Mirrors `EKEventStore.defaultCalendarForNewEvents`.",
+        annotations(
+            title = "Get Default Event Calendar",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn get_default_event_calendar(&self) -> Result<Json<CalendarOutput>, McpError> {
         let manager = EventsManager::new();
@@ -1772,7 +1891,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Set an event's availability — controls how the event shows on the timeline. Use \"busy\" (default), \"free\", \"tentative\", or \"unavailable\". Always applies to just this occurrence (per-instance attribute)."
+        description = "Set an event's availability — controls how the event shows on the timeline. Use \"busy\" (default), \"free\", \"tentative\", or \"unavailable\". Always applies to just this occurrence (per-instance attribute).",
+        annotations(
+            title = "Set Event Availability",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn set_event_availability(
         &self,
@@ -1790,7 +1916,8 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "List calendar events. By default shows today's events. Can specify a date range."
+        description = "List calendar events. By default shows today's events. Can specify a date range.",
+        annotations(title = "List Events", read_only_hint = true, open_world_hint = false)
     )]
     async fn list_events(
         &self,
@@ -1830,7 +1957,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Create a new calendar event in macOS Calendar. Inline configuration: title, start/end (or duration), location, calendar, all-day flag, URL, alarms (time-based; events don't support proximity alarms), recurrence."
+        description = "Create a new calendar event in macOS Calendar. Inline configuration: title, start/end (or duration), location, calendar, all-day flag, URL, alarms (time-based; events don't support proximity alarms), recurrence.",
+        annotations(
+            title = "Create Event",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn create_event(
         &self,
@@ -1899,7 +2033,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Delete a calendar event. `span: \"this\" | \"future\"` controls recurring-event scope (default: \"this\"). The legacy boolean `affect_future` is still accepted as an alias for `span: \"future\"`."
+        description = "Delete a calendar event. `span: \"this\" | \"future\"` controls recurring-event scope (default: \"this\"). The legacy boolean `affect_future` is still accepted as an alias for `span: \"future\"`.",
+        annotations(
+            title = "Delete Event",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn delete_event(
         &self,
@@ -1916,7 +2057,10 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Get a single calendar event by its unique identifier.")]
+    #[tool(
+        description = "Get a single calendar event by its unique identifier.",
+        annotations(title = "Get Event", read_only_hint = true, open_world_hint = false)
+    )]
     async fn get_event(
         &self,
         Parameters(params): Parameters<EventIdRequest>,
@@ -1932,7 +2076,16 @@ impl EventKitServer {
     // Event Calendar Management
     // ========================================================================
 
-    #[tool(description = "Create a new calendar for events.")]
+    #[tool(
+        description = "Create a new calendar for events.",
+        annotations(
+            title = "Create Event Calendar",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn create_event_calendar(
         &self,
         Parameters(params): Parameters<CreateReminderListRequest>,
@@ -1944,7 +2097,16 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Update an event calendar — change name and/or color.")]
+    #[tool(
+        description = "Update an event calendar — change name and/or color.",
+        annotations(
+            title = "Update Event Calendar",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn update_event_calendar(
         &self,
         Parameters(params): Parameters<UpdateEventCalendarRequest>,
@@ -1961,7 +2123,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Delete an event calendar. WARNING: This will delete all events in the calendar!"
+        description = "Delete an event calendar. WARNING: This will delete all events in the calendar!",
+        annotations(
+            title = "Delete Event Calendar",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn delete_event_calendar(
         &self,
@@ -1978,7 +2147,14 @@ impl EventKitServer {
     // Sources
     // ========================================================================
 
-    #[tool(description = "List all available sources (accounts like iCloud, Local, Exchange).")]
+    #[tool(
+        description = "List all available sources (accounts like iCloud, Local, Exchange).",
+        annotations(
+            title = "List Accounts",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn list_sources(&self) -> Result<Json<ListResponse<SourceOutput>>, McpError> {
         let manager = RemindersManager::new();
         match manager.list_sources() {
@@ -1998,7 +2174,14 @@ impl EventKitServer {
     // ========================================================================
 
     #[tool(
-        description = "Update an existing calendar event. All fields are optional; only those you supply are written. Inline edits: title, notes (empty clears), location (empty clears), start/end, all_day toggle, calendar move (`calendar_name`), URL (empty clears), availability, structured_location (null clears), alarms (replaces all), recurrence (empty frequency clears). `span: \"this\" | \"future\"` controls recurring-event edit scope; defaults to \"this\"."
+        description = "Update an existing calendar event. All fields are optional; only those you supply are written. Inline edits: title, notes (empty clears), location (empty clears), start/end, all_day toggle, calendar move (`calendar_name`), URL (empty clears), availability, structured_location (null clears), alarms (replaces all), recurrence (empty frequency clears). `span: \"this\" | \"future\"` controls recurring-event edit scope; defaults to \"this\".",
+        annotations(
+            title = "Update Event",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn update_event(
         &self,
@@ -2085,7 +2268,12 @@ impl EventKitServer {
 
     #[cfg(feature = "location")]
     #[tool(
-        description = "Get the user's current location (latitude, longitude). Requires location permission."
+        description = "Get the user's current location (latitude, longitude). Requires location permission.",
+        annotations(
+            title = "Get Current Location",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn get_current_location(&self) -> Result<Json<CoordinateOutput>, McpError> {
         let manager = crate::location::LocationManager::new();
@@ -2102,7 +2290,8 @@ impl EventKitServer {
     // ========================================================================
 
     #[tool(
-        description = "Search reminders or events by text in title or notes (case-insensitive). Specify item_type to filter, or omit to search both."
+        description = "Search reminders or events by text in title or notes (case-insensitive). Specify item_type to filter, or omit to search both.",
+        annotations(title = "Search", read_only_hint = true, open_world_hint = false)
     )]
     async fn search(
         &self,
@@ -2175,7 +2364,16 @@ impl EventKitServer {
     // Batch Operations
     // ========================================================================
 
-    #[tool(description = "Delete multiple reminders or events at once.")]
+    #[tool(
+        description = "Delete multiple reminders or events at once.",
+        annotations(
+            title = "Batch Delete",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn batch_delete(
         &self,
         Parameters(params): Parameters<BatchDeleteRequest>,
@@ -2222,7 +2420,16 @@ impl EventKitServer {
         }))
     }
 
-    #[tool(description = "Move multiple reminders to a different list at once.")]
+    #[tool(
+        description = "Move multiple reminders to a different list at once.",
+        annotations(
+            title = "Batch Move Reminders",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn batch_move(
         &self,
         Parameters(params): Parameters<BatchMoveRequest>,
@@ -2262,7 +2469,16 @@ impl EventKitServer {
         }))
     }
 
-    #[tool(description = "Update multiple reminders or events at once.")]
+    #[tool(
+        description = "Update multiple reminders or events at once.",
+        annotations(
+            title = "Batch Update",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn batch_update(
         &self,
         Parameters(params): Parameters<BatchUpdateRequest>,

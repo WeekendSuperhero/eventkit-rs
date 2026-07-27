@@ -261,3 +261,73 @@ fn mcp_handles_multiple_sequential_requests_without_panic() {
     let _ = c.list_tools();
     let _ = c.call_tool("auth_status", json!({}));
 }
+
+/// EVERY tool must carry annotations, and the safety hints must be coherent.
+///
+/// The host groups a backend's tools by annotation
+/// (`BackendNutritionCard.tsx::groupToolsByAnnotation`): `readOnlyHint` →
+/// "Read-Only", `destructiveHint` → "Destructive", neither → "Safe Write",
+/// and **no annotations at all → "Other"**. Before this, all 32 EventKit tools
+/// had none, so the entire server collapsed into one undifferentiated "Other"
+/// bucket and the user got no read-vs-destroy signal anywhere in the UI.
+///
+/// This fails if a new tool ships unannotated, which would silently put it
+/// back in "Other".
+#[test]
+fn mcp_every_tool_is_annotated_and_coherent() {
+    let mut c = McpClient::spawn();
+    c.initialize();
+    let tools = c.list_tools();
+    assert!(!tools.is_empty(), "tools/list must not be empty");
+
+    let mut unannotated = Vec::new();
+    let mut incoherent = Vec::new();
+    let (mut read_only, mut destructive, mut safe_write) = (0, 0, 0);
+
+    for t in &tools {
+        let name = t["name"].as_str().unwrap_or("<unnamed>").to_string();
+        let Some(ann) = t.get("annotations").filter(|a| a.is_object()) else {
+            unannotated.push(name);
+            continue;
+        };
+        let ro = ann["readOnlyHint"].as_bool().unwrap_or(false);
+        let de = ann["destructiveHint"].as_bool().unwrap_or(false);
+
+        // A read-only tool cannot also be destructive — that is a contradiction,
+        // and the grouping would silently prefer "Read-Only" and hide the risk.
+        if ro && de {
+            incoherent.push(name.clone());
+        }
+        // Every tool should carry a human title for the UI.
+        if ann["title"].as_str().unwrap_or("").is_empty() {
+            incoherent.push(format!("{name} (no title)"));
+        }
+
+        if ro {
+            read_only += 1;
+        } else if de {
+            destructive += 1;
+        } else {
+            safe_write += 1;
+        }
+    }
+
+    assert!(
+        unannotated.is_empty(),
+        "these tools have NO annotations and would fall into the host's \"Other\" \
+         bucket: {unannotated:?}"
+    );
+    assert!(
+        incoherent.is_empty(),
+        "incoherent or untitled annotations: {incoherent:?}"
+    );
+
+    // Sanity: this server genuinely spans all three groups. If a whole class
+    // vanished, the classification was probably flattened by accident.
+    assert!(read_only > 0, "expected some read-only tools");
+    assert!(destructive > 0, "expected some destructive tools (deletes)");
+    assert!(
+        safe_write > 0,
+        "expected some safe-write tools (creates/updates)"
+    );
+}
