@@ -92,6 +92,33 @@ impl McpClient {
         self.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
     }
 
+    /// Send an arbitrary JSON-RPC request and return the response.
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        self.recv_response(id, Duration::from_secs(10))
+    }
+
+    /// Read lines until a NOTIFICATION with `method` arrives, or timeout.
+    /// Responses seen along the way are discarded.
+    fn wait_for_notification(&mut self, method: &str, timeout: Duration) -> Option<Value> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let mut line = String::new();
+            if self.stdout.read_line(&mut line).ok()? == 0 {
+                return None;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            if v.get("id").is_none() && v.get("method").and_then(Value::as_str) == Some(method) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
     fn list_tools(&mut self) -> Vec<Value> {
         self.next_id += 1;
         let id = self.next_id;
@@ -329,5 +356,131 @@ fn mcp_every_tool_is_annotated_and_coherent() {
     assert!(
         safe_write > 0,
         "expected some safe-write tools (creates/updates)"
+    );
+}
+
+/// The server must ADVERTISE tasks with the shape it actually implements.
+///
+/// `enable_tasks()` alone serializes an empty `tasks: {}`, which under-declares
+/// the surface — a client can't tell whether `tasks/list` or `tasks/cancel`
+/// exist. `TasksCapability::server_default()` declares
+/// `requests.tools.call` + `list` + `cancel`, which is exactly what this
+/// server implements.
+#[test]
+fn mcp_advertises_the_task_capability_it_implements() {
+    let mut c = McpClient::spawn();
+    c.next_id += 1;
+    let id = c.next_id;
+    c.send(&json!({
+        "jsonrpc": "2.0", "id": id, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "eventkit-mcp-smoke", "version": "0"},
+        },
+    }));
+    let resp = c.recv_response(id, Duration::from_secs(5));
+    let tasks = &resp["result"]["capabilities"]["tasks"];
+    assert!(
+        tasks.is_object(),
+        "tasks capability must be advertised: {resp}"
+    );
+    assert!(
+        tasks["requests"]["tools"]["call"].is_object(),
+        "task-augmented tools/call must be declared: {tasks}"
+    );
+    assert!(
+        tasks["list"].is_object(),
+        "tasks/list must be declared: {tasks}"
+    );
+    assert!(
+        tasks["cancel"].is_object(),
+        "tasks/cancel must be declared: {tasks}"
+    );
+}
+
+/// Slow tools must declare `execution.taskSupport`, or a host has no way to
+/// know it may run them task-augmented and will keep timing them out.
+#[test]
+fn mcp_slow_tools_declare_task_support() {
+    let mut c = McpClient::spawn();
+    c.initialize();
+    let tools = c.list_tools();
+    let capable: Vec<&str> = tools
+        .iter()
+        .filter(|t| !t["execution"]["taskSupport"].is_null())
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    for expected in ["search", "batch_delete", "batch_move", "batch_update"] {
+        assert!(
+            capable.contains(&expected),
+            "`{expected}` is slow enough to need taskSupport; declared: {capable:?}"
+        );
+    }
+}
+
+/// End-to-end: a task-augmented call returns a task id, the task reaches a
+/// terminal state, `tasks/result` yields the payload — and the server PUSHES
+/// `notifications/tasks/status` rather than making the client poll.
+///
+/// The push is the part worth guarding. A task server that only answers polls
+/// is half a task server, and the notification is invisible to any test that
+/// just calls `tasks/get` in a loop.
+#[test]
+fn mcp_task_roundtrip_emits_status_notification() {
+    let mut c = McpClient::spawn();
+    c.initialize();
+
+    // MUST be a tool that DECLARES taskSupport — rmcp rejects task-augmenting
+    // one that doesn't ("Tool does not support task-based invocation"), which
+    // is the correct advertised==invokable behaviour. `search` is declared.
+    //
+    // Works on an unauthorized host too: the tool fails inside the worker, the
+    // task goes to `failed`, and the status push still fires — which is the
+    // property under test.
+    let created = c.request(
+        "tools/call",
+        json!({
+            "name": "search",
+            "arguments": {"query": "eventkit-task-smoke-probe"},
+            "task": {}
+        }),
+    );
+    let task_id = created["result"]["task"]["taskId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a created task: {created}"))
+        .to_string();
+    assert_eq!(
+        created["result"]["task"]["status"], "working",
+        "a fresh task starts working: {created}"
+    );
+
+    // THE ASSERTION THAT MATTERS: the terminal transition arrives unprompted.
+    let note = c
+        .wait_for_notification("notifications/tasks/status", Duration::from_secs(10))
+        .expect("server must PUSH tasks/status on the terminal transition, not force a poll");
+    assert_eq!(note["params"]["taskId"], task_id.as_str());
+    let pushed = note["params"]["status"].as_str().unwrap_or("");
+    assert!(
+        matches!(pushed, "completed" | "failed"),
+        "pushed status must be terminal, got {pushed:?}"
+    );
+
+    // And the result is retrievable afterwards.
+    let payload = c.request("tasks/result", json!({"taskId": task_id}));
+    assert!(
+        payload.get("result").is_some(),
+        "tasks/result must yield the payload: {payload}"
+    );
+
+    // tasks/list must include it.
+    let listed = c.request("tasks/list", json!({}));
+    let ids: Vec<&str> = listed["result"]["tasks"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|t| t["taskId"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        ids.contains(&task_id.as_str()),
+        "tasks/list must include it: {listed}"
     );
 }
