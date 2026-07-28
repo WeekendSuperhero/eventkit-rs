@@ -1,0 +1,36 @@
+name: PR Review (Muse)
+
+# Label-gated three-agent review loop: add the `muse:review` label to a PR
+# to run a round (code review · security · test coverage). Logic lives in
+# platform-tools' reusable-pr-review.yml; the loop, labels, delta rounds,
+# and failure modes are documented in platform-tools' docs/muse-workflows.md.
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+
+jobs:
+  review:
+    # Exact-match guard: the labels the loop writes itself (muse:reviewing,
+    # review:approved, …) must NOT re-enter the concurrency group below — a
+    # startsWith('muse:') guard would let our own label writes cancel the
+    # in-flight round.
+    if: >-
+      github.event.action == 'synchronize'
+      || github.event.label.name == 'muse:review'
+      || github.event.label.name == 'muse:force'
+    # Job-level (not workflow-level) so guard-skipped runs never claim the
+    # group; a new press or a push cancels a stale in-flight round.
+    concurrency:
+      group: pr-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-pr-review.yml@72bbd124823a11bc4cd1d517af08b608346b09cc
+    with:
+      runs-on: ubuntu-latest
+      max-commit-messages: 300
+      # House rules appended to each agent's prompt, per lens.
+    secrets: inherit
