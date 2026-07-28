@@ -3081,7 +3081,7 @@ impl rmcp::ServerHandler for EventKitServer {
 
 /// Serve the EventKit MCP server on any async read/write transport.
 ///
-/// Used by the in-process gateway (via `DuplexStream`) and for testing.
+/// Used by the in-process bridge (via `DuplexStream`) and for testing.
 /// The standalone binary uses [`run_mcp_server`] which wraps this with stdio.
 pub async fn serve_on<T>(transport: T) -> anyhow::Result<()>
 where

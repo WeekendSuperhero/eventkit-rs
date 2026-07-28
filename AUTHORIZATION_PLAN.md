@@ -255,7 +255,7 @@ bugs are invisible without a test.
 
 ## Consumer-side notes
 
-- `app-api/src/gateway.rs:137` runs `eventkit::mcp::serve_on(transport)` **in-process**, so
+- `app-api/src/bridge.rs:137` runs `eventkit::mcp::serve_on(transport)` **in-process**, so
   TCC attributes to the host app bundle — no entitlement change needed for any of this.
 - After step 2, the app surfaces a new error for write-only users. Make sure the MCP tool
   error text tells them to grant *full* access, since "denied" would be misleading.
