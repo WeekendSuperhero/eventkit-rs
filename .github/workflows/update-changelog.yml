@@ -1,0 +1,23 @@
+name: Update Changelog
+
+on:
+  workflow_dispatch: # manual trigger
+  # schedule:
+  #   - cron: "0 0 * * 1"  # every Monday (optional)
+
+jobs:
+  changelog:
+    permissions:
+      contents: write
+    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-changelog.yml@72bbd124823a11bc4cd1d517af08b608346b09cc
+    with:
+      changelog-path: CHANGELOG.md
+      # Split mode: CHANGELOG.md stays purely user-facing (it ships verbatim
+      # as GitHub Release notes, updater notes, and TestFlight "What to
+      # Test"); mechanics land in CHANGELOG_INTERNAL.md. One Jules call
+      # classifies both. Requires platform-tools PR #1 (the input exists
+      # there) — merge that first.
+      internal-changelog-path: CHANGELOG_INTERNAL.md
+      runs-on: ubuntu-latest
+      pr-branch-prefix: "chore/changelog-"
+    secrets: inherit

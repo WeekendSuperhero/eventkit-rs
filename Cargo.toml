@@ -2,7 +2,7 @@
 
 [package]
 name = "eventkit-rs"
-version = "0.5.6"
+version = "0.6.0"
 edition = "2024"
 description = "A Rust library and CLI for managing macOS Calendar events and Reminders via EventKit"
 documentation = "https://docs.rs/eventkit-rs"
@@ -30,11 +30,15 @@ path = "src/main.rs"
 # Cross-platform dependencies
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+# Lock pair for the blocking Obj-C completion-block bridges in `imp.rs`.
+# Non-poisoning (a panic in a completion block can't brick later lock()s) and
+# already in the tree via tokio, so this adds no new compile unit.
+parking_lot = "0.12"
 thiserror = "2"
 
 # Optional cross-platform dependencies (gated behind features)
 anyhow = { version = "1", optional = true }
-rmcp = { version = "1.7", features = [
+rmcp = { version = "=2.2.0", features = [
   # `macros` + `server` come from rmcp defaults; `transport-async-rw` is
   # transitively pulled by `transport-io`. Only `transport-io` is needed
   # to expose `rmcp::transport::stdio()` for the standalone `--mcp`
@@ -45,7 +49,13 @@ rmcp = { version = "1.7", features = [
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 tokio = { version = "1.52", features = ["full"], optional = true }
-tracing = { version = "0.1", optional = true, features = ["release_max_level_info"] }
+# MCP task surface (SEP-1686): cancellation tokens + task identifiers.
+tokio-util = { version = "0.7", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+# NOT optional: `imp.rs` logs unconditionally (a `--no-default-features
+# --features reminders` build failed to compile before this). `tracing` is a
+# facade — with no subscriber installed the macros compile to near-nothing.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # macOS-only dependencies (EventKit/objc2 bindings)
@@ -109,7 +119,8 @@ mcp = [
   "dep:serde",
   "dep:serde_json",
   "dep:tokio",
-  "dep:tracing",
+  "dep:tokio-util",
+  "dep:uuid",
   "dep:tracing-subscriber"
 ]
 reminders = []

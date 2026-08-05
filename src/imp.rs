@@ -12,7 +12,15 @@ use objc2_event_kit::{
 use objc2_foundation::{
     NSArray, NSCalendar, NSDate, NSDateComponents, NSError, NSNumber, NSString,
 };
-use std::sync::{Arc, Condvar, Mutex};
+// parking_lot for the lock pair, std only for `Arc`.
+//
+// These mutexes are paired with a `Condvar` to block on an Obj-C completion
+// block. `std::sync::Mutex` POISONS: a panic inside the completion block while
+// holding the lock would make every later `lock()` panic, permanently bricking
+// the manager instead of failing one call. parking_lot doesn't poison, which
+// also removes the `.unwrap()` from every acquisition.
+use parking_lot::{Condvar, Mutex};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[cfg(feature = "location")]
@@ -31,6 +39,19 @@ pub enum EventKitError {
 
     #[error("Authorization restricted by system policy")]
     AuthorizationRestricted,
+
+    /// Write-only access was granted, but the operation needs to READ.
+    ///
+    /// Distinct from [`EventKitError::AuthorizationDenied`] because the remedy
+    /// differs — the user must grant FULL access in System Settings, not
+    /// reverse a denial. Apple returns no events at all to a write-only
+    /// client, so treating this as authorized yields a silently empty result
+    /// rather than an error.
+    #[error(
+        "Write-only access granted — full access is required to read calendars, events, or \
+         reminders. Grant full access in System Settings › Privacy & Security."
+    )]
+    AuthorizationWriteOnly,
 
     #[error("Authorization not determined")]
     AuthorizationNotDetermined,
@@ -353,16 +374,186 @@ pub struct RecurrenceRule {
     pub set_positions: Option<Vec<i32>>,
 }
 
+/// How long a blocking bridge waits for an EventKit completion block.
+///
+/// Every condvar wait in this file parks a thread until an Obj-C completion
+/// block fires. Unbounded, that is a permanent thread wedge whenever the block
+/// never arrives — and the MCP server runs these on tokio worker threads it
+/// cannot spare, so a wedged wait removes a worker from the pool for the life
+/// of the process. Bounding it turns "the server silently stopped answering"
+/// into an error the caller can see and retry.
+const COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Authorization gets a longer budget than data calls: it waits on a HUMAN
+/// dismissing the TCC consent dialog, not on the framework. Still bounded — a
+/// process that can never show a dialog (headless, no TCC grant, no GUI
+/// session) would otherwise leave `requestFullAccessTo*` outstanding forever.
+const AUTHORIZATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Park until a completion block fills the slot, or `timeout` elapses.
+///
+/// Returns `false` on timeout, leaving the slot untouched so the caller decides
+/// which error to report. The loop is required because a condvar may wake
+/// spuriously.
+fn wait_for_completion<T>(
+    cvar: &Condvar,
+    guard: &mut parking_lot::MutexGuard<'_, Option<T>>,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while guard.is_none() {
+        if cvar.wait_until(guard, deadline).timed_out() {
+            return false;
+        }
+    }
+    true
+}
+
+/// A thread's cached `EKEventStore` plus the authorization status last
+/// observed through it.
+///
+/// Apple: *"Set up your app to instantiate and use a **single instance** of
+/// `EKEventStore` that manages all reminder-related tasks. An `EKEventStore`
+/// object requires a **significant amount of time to initialize and
+/// release**."* Constructing one per call made every tool invocation pay full
+/// EventKit init/teardown.
+///
+/// **Why thread-local and not a `OnceLock` global:** `EKEventStore` is
+/// `!Send + !Sync`. A global would demand both. It also has to stay that way —
+/// `mcp.rs`'s handlers deliberately keep these values stack-local and never
+/// hold one across an `.await`, which is what makes the generated futures
+/// `Send` and lets the server run on a normal multi-thread tokio runtime
+/// without rmcp's `local` feature. A thread-local keeps that invariant intact
+/// while still amortising construction: one store per worker thread instead of
+/// one per call.
+struct StoreCache {
+    store: Retained<EKEventStore>,
+    /// Status observed the last time this store was used. `None` until the
+    /// first check. Drives the `reset()` decision below.
+    last_status: Option<AuthorizationStatus>,
+}
+
+impl StoreCache {
+    /// Build a cache entry around a fresh store.
+    ///
+    /// **Do not call any EventKit accessor here.** Construction happens on
+    /// EVERY `Manager::new()`, including long before authorization exists, and
+    /// most `EKEventStore` accessors are declared non-null by `objc2` while
+    /// actually returning NULL to an unauthorized process — which aborts the
+    /// calling thread.
+    ///
+    /// This bit us: a `eventStoreIdentifier()` call added here to detect a
+    /// recreated calendar database panicked with *"unexpected NULL returned
+    /// from -[EKEventStore eventStoreIdentifier]"* on any machine that hadn't
+    /// granted access yet. The panic landed BEFORE `ensure_full_access`, so
+    /// `request_access()` never ran and the TCC consent dialog never appeared
+    /// — the feature looked simply broken, with no permission prompt. It was
+    /// invisible in tests because the dev host had already granted access.
+    fn build() -> Self {
+        Self {
+            store: unsafe { EKEventStore::new() },
+            last_status: None,
+        }
+    }
+
+    /// Reconcile the cached store with the CURRENT authorization status,
+    /// resetting it when the grant changed underneath us.
+    ///
+    /// **This is the half that must never be separated from the caching.**
+    /// Apple: *"If you request events before prompting people for access with
+    /// this method, you'll need to reset the event store with the `reset()`
+    /// method"* to see data after the grant. Per-call construction used to make
+    /// that free — every call got a store that already reflected current state
+    /// — so caching without this would reintroduce the same silently-empty
+    /// results by a different route: a user who grants access in System
+    /// Settings mid-session would keep getting nothing until an app restart.
+    ///
+    /// `refreshSourcesIfNecessary()` is NOT a substitute; it refreshes account
+    /// sources, not post-authorization state.
+    ///
+    /// **Why calling `reset()` here is safe.** Apple's full contract is
+    /// harsher than the reset-after-grant note suggests: *"All existing
+    /// objects created or retrieved using this store are disassociated from it
+    /// and are **invalid**."* Two properties keep that from biting:
+    ///
+    /// 1. `reconcile` runs at the TOP of `ensure_access`, before the calling
+    ///    operation has fetched anything, so no live `EKObject` from this
+    ///    store is in flight when the reset lands.
+    /// 2. Nothing this crate returns to a caller is a live EventKit object.
+    ///    `ReminderItem` / `EventItem` / `CalendarInfo` are owned Rust structs
+    ///    converted at the boundary, so an invalidated `EKReminder` can never
+    ///    escape into caller hands.
+    ///
+    /// If either changes — an `ensure_*` moved below a fetch, or a live
+    /// `Retained<EKObject>` became part of the public API — this reset would
+    /// start invalidating objects out from under callers.
+    fn reconcile(&mut self, current: AuthorizationStatus) {
+        if needs_store_reset(self.last_status, current) {
+            unsafe { self.store.reset() };
+        }
+        self.last_status = Some(current);
+    }
+}
+
+/// Should a cached store be reset, given the status it last saw and the
+/// current one?
+///
+/// Split out so the policy is unit-testable — the effect (`EKEventStore::reset`)
+/// has no observable result, so the DECISION is the only thing a test can
+/// assert on. `reconcile` is the sole caller; keeping one function means the
+/// test cannot drift from the behaviour.
+fn needs_store_reset(previous: Option<AuthorizationStatus>, current: AuthorizationStatus) -> bool {
+    match previous {
+        // Unchanged — do NOT reset. `reset()` discards uncommitted changes, so
+        // calling it gratuitously would drop a caller's in-flight edits.
+        Some(p) if p == current => false,
+        // First use on this thread: nothing has been read through the store
+        // yet, so there is no stale state to clear.
+        None => false,
+        Some(_) => true,
+    }
+}
+
+thread_local! {
+    /// Per-thread reminders store. See [`StoreCache`].
+    static REMINDER_STORE: std::cell::RefCell<Option<StoreCache>> =
+        const { std::cell::RefCell::new(None) };
+    /// Per-thread events store. Separate from the reminders one because the
+    /// two managers have always held distinct stores; unifying them is a
+    /// larger change than the caching fix warrants.
+    static EVENT_STORE: std::cell::RefCell<Option<StoreCache>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The main reminders manager providing access to EventKit functionality
 pub struct RemindersManager {
     store: Retained<EKEventStore>,
 }
 
 impl RemindersManager {
-    /// Creates a new RemindersManager instance
+    /// Creates a new RemindersManager instance.
+    ///
+    /// Cheap: the underlying `EKEventStore` is cached per thread and this only
+    /// retains it (see the private `StoreCache`). Callers may keep constructing managers
+    /// freely — that was the pre-existing pattern at ~68 call sites and it no
+    /// longer pays EventKit initialization each time.
     pub fn new() -> Self {
-        let store = unsafe { EKEventStore::new() };
+        let store = REMINDER_STORE.with(|cell| {
+            cell.borrow_mut()
+                .get_or_insert_with(StoreCache::build)
+                .store
+                .clone()
+        });
         Self { store }
+    }
+
+    /// Whether two managers share the same underlying `EKEventStore`.
+    ///
+    /// Diagnostic for the thread-local store cache — repeated construction on
+    /// one thread should retain a single store rather than build a new one.
+    /// Pointer identity, so it is deterministic (unlike timing).
+    pub fn shares_store_with(&self, other: &Self) -> bool {
+        std::ptr::eq(&*self.store, &*other.store)
     }
 
     /// Gets the current authorization status for reminders
@@ -388,7 +579,7 @@ impl RemindersManager {
             };
 
             let (lock, cvar) = &*result_clone;
-            let mut res = lock.lock().unwrap();
+            let mut res = lock.lock();
             *res = Some((granted.as_bool(), error_msg));
             cvar.notify_one();
         });
@@ -401,9 +592,11 @@ impl RemindersManager {
         }
 
         let (lock, cvar) = &*result;
-        let mut res = lock.lock().unwrap();
-        while res.is_none() {
-            res = cvar.wait(res).unwrap();
+        let mut res = lock.lock();
+        if !wait_for_completion(cvar, &mut res, AUTHORIZATION_TIMEOUT) {
+            return Err(RemindersError::AuthorizationRequestFailed(
+                "timed out waiting for the system authorization response".to_string(),
+            ));
         }
 
         match res.take() {
@@ -415,26 +608,68 @@ impl RemindersManager {
         }
     }
 
-    /// Ensures we have authorization, requesting if needed
-    pub fn ensure_authorized(&self) -> Result<()> {
-        match Self::authorization_status() {
-            AuthorizationStatus::FullAccess => Ok(()),
-            AuthorizationStatus::NotDetermined => {
-                if self.request_access()? {
-                    Ok(())
-                } else {
-                    Err(RemindersError::AuthorizationDenied)
+    /// Resolve an authorization check for `need`, prompting once if the user
+    /// has not decided yet.
+    ///
+    /// Shared by [`ensure_full_access`](Self::ensure_full_access) and
+    /// [`ensure_write_access`](Self::ensure_write_access) — the decision table
+    /// lives in [`authorization_verdict`], this only adds the side effect
+    /// (prompt) and the re-check.
+    fn ensure_access(&self, need: AccessNeed) -> Result<()> {
+        let status = Self::authorization_status();
+        Self::reconcile_store(status);
+        match authorization_verdict(need, status) {
+            AuthVerdict::Allowed => Ok(()),
+            AuthVerdict::Refused(refusal) => Err(refusal.into_error()),
+            AuthVerdict::MustRequest => {
+                self.request_access()?;
+                // Re-check rather than trusting the `granted` bool: the user
+                // may have granted a level that still doesn't cover `need`.
+                // Reconciling here is the load-bearing call — this is the
+                // NotDetermined → FullAccess transition, exactly the case
+                // Apple says needs `reset()` before the store returns data.
+                let status = Self::authorization_status();
+                Self::reconcile_store(status);
+                match authorization_verdict(need, status) {
+                    AuthVerdict::Allowed => Ok(()),
+                    AuthVerdict::Refused(refusal) => Err(refusal.into_error()),
+                    // Still undecided after prompting — treat as a denial.
+                    AuthVerdict::MustRequest => Err(RemindersError::AuthorizationDenied),
                 }
             }
-            AuthorizationStatus::Denied => Err(RemindersError::AuthorizationDenied),
-            AuthorizationStatus::Restricted => Err(RemindersError::AuthorizationRestricted),
-            AuthorizationStatus::WriteOnly => Ok(()), // Can still read with write-only in some cases
         }
+    }
+
+    /// Reset this thread's cached store if the grant changed since last use.
+    fn reconcile_store(status: AuthorizationStatus) {
+        REMINDER_STORE.with(|cell| {
+            if let Some(cache) = cell.borrow_mut().as_mut() {
+                cache.reconcile(status);
+            }
+        });
+    }
+
+    /// Full access — required for ANY read/list/search/update/delete path.
+    ///
+    /// `WriteOnly` is an ERROR here. Apple does not return reminders to a
+    /// write-only client, so allowing the call would produce an empty result
+    /// indistinguishable from a genuinely empty list.
+    ///
+    /// (Reminders has no write-only tier — only `requestFullAccessToReminders`
+    /// exists — so that arm is unreachable in practice. It is kept as a
+    /// defensive refusal rather than a silent `Ok`.)
+    pub fn ensure_full_access(&self) -> Result<()> {
+        self.ensure_access(AccessNeed::Full)
+    }
+
+    /// Create-only paths. Both `FullAccess` and `WriteOnly` satisfy this.
+    pub fn ensure_write_access(&self) -> Result<()> {
+        self.ensure_access(AccessNeed::Write)
     }
 
     /// Lists all reminder calendars (lists)
     pub fn list_calendars(&self) -> Result<Vec<CalendarInfo>> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
 
         let calendars = unsafe { self.store.calendarsForEntityType(EKEntityType::Reminder) };
 
@@ -448,7 +683,7 @@ impl RemindersManager {
 
     /// Lists all available sources (iCloud, Local, Exchange, etc.)
     pub fn list_sources(&self) -> Result<Vec<SourceInfo>> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let sources = unsafe { self.store.sources() };
         let mut result = Vec::new();
         for source in sources.iter() {
@@ -459,7 +694,7 @@ impl RemindersManager {
 
     /// Gets the default calendar for new reminders
     pub fn default_calendar(&self) -> Result<CalendarInfo> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
 
         let calendar = unsafe { self.store.defaultCalendarForNewReminders() };
 
@@ -476,7 +711,7 @@ impl RemindersManager {
 
     /// Fetches reminders from specific calendars (blocking)
     pub fn fetch_reminders(&self, calendar_titles: Option<&[&str]>) -> Result<Vec<ReminderItem>> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
 
         let calendars: Option<Retained<NSArray<EKCalendar>>> = match calendar_titles {
             Some(titles) => {
@@ -517,7 +752,7 @@ impl RemindersManager {
                 reminders.iter().map(|r| reminder_to_item(&r)).collect()
             };
             let (lock, cvar) = &*result_clone;
-            let mut guard = lock.lock().unwrap();
+            let mut guard = lock.lock();
             *guard = Some(items);
             cvar.notify_one();
         });
@@ -528,9 +763,11 @@ impl RemindersManager {
         }
 
         let (lock, cvar) = &*result;
-        let mut guard = lock.lock().unwrap();
-        while guard.is_none() {
-            guard = cvar.wait(guard).unwrap();
+        let mut guard = lock.lock();
+        if !wait_for_completion(cvar, &mut guard, COMPLETION_TIMEOUT) {
+            return Err(RemindersError::FetchFailed(
+                "timed out waiting for EventKit to return reminders".to_string(),
+            ));
         }
 
         guard
@@ -553,7 +790,7 @@ impl RemindersManager {
         ending: Option<DateTime<Local>>,
         calendar_titles: Option<&[&str]>,
     ) -> Result<Vec<ReminderItem>> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let calendars = self.resolve_reminder_calendars(calendar_titles)?;
         let start_ns = starting.map(datetime_to_nsdate);
         let end_ns = ending.map(datetime_to_nsdate);
@@ -577,7 +814,7 @@ impl RemindersManager {
         ending: Option<DateTime<Local>>,
         calendar_titles: Option<&[&str]>,
     ) -> Result<Vec<ReminderItem>> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let calendars = self.resolve_reminder_calendars(calendar_titles)?;
         let start_ns = starting.map(datetime_to_nsdate);
         let end_ns = ending.map(datetime_to_nsdate);
@@ -634,7 +871,7 @@ impl RemindersManager {
                 reminders.iter().map(|r| reminder_to_item(&r)).collect()
             };
             let (lock, cvar) = &*result_clone;
-            let mut guard = lock.lock().unwrap();
+            let mut guard = lock.lock();
             *guard = Some(items);
             cvar.notify_one();
         });
@@ -645,9 +882,11 @@ impl RemindersManager {
         }
 
         let (lock, cvar) = &*result;
-        let mut guard = lock.lock().unwrap();
-        while guard.is_none() {
-            guard = cvar.wait(guard).unwrap();
+        let mut guard = lock.lock();
+        if !wait_for_completion(cvar, &mut guard, COMPLETION_TIMEOUT) {
+            return Err(RemindersError::FetchFailed(
+                "timed out waiting for EventKit to return reminders".to_string(),
+            ));
         }
         guard
             .take()
@@ -657,7 +896,16 @@ impl RemindersManager {
     /// Creates a new reminder. Build the input with `ReminderDraft` —
     /// only `title` is required; spread `..Default::default()` for the rest.
     pub fn create_reminder(&self, draft: &ReminderDraft<'_>) -> Result<ReminderItem> {
-        self.ensure_authorized()?;
+        // A write-only grant DOES permit creating into the default calendar —
+        // that is exactly the tier Apple designed it for. It does NOT permit
+        // resolving a calendar BY TITLE, which reads the calendar list and
+        // returns nothing to a write-only client. Gate on what this call
+        // actually needs so write-only users keep the capability they have.
+        if draft.calendar_title.is_some() {
+            self.ensure_full_access()?;
+        } else {
+            self.ensure_write_access()?;
+        }
 
         let reminder = unsafe { EKReminder::reminderWithEventStore(&self.store) };
 
@@ -717,7 +965,7 @@ impl RemindersManager {
         identifier: &str,
         patch: &ReminderPatch<'_>,
     ) -> Result<ReminderItem> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
 
         let reminder = self.find_reminder_by_id(identifier)?;
 
@@ -818,7 +1066,7 @@ impl RemindersManager {
 
     /// Deletes a reminder
     pub fn delete_reminder(&self, identifier: &str) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
 
         let reminder = self.find_reminder_by_id(identifier)?;
 
@@ -833,7 +1081,7 @@ impl RemindersManager {
 
     /// Gets a reminder by its identifier
     pub fn get_reminder(&self, identifier: &str) -> Result<ReminderItem> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         Ok(reminder_to_item(&reminder))
     }
@@ -849,7 +1097,7 @@ impl RemindersManager {
     /// hardcoded denylist in `reflect_object_full`. Use `false` for a fully
     /// safe schema-only listing.
     pub fn dump_reminder_raw(&self, identifier: &str, read_values: bool) -> Result<String> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let reminder = self.find_reminder_by_id(identifier)?;
 
         let mut out = String::new();
@@ -886,9 +1134,11 @@ impl RemindersManager {
     /// `richLink`). Each call is wrapped in an Objective-C exception catch.
     /// Read-only — never invokes any setter.
     pub fn dump_reminder_private(&self, identifier: &str) -> Result<String> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let reminder = self.find_reminder_by_id(identifier)?;
-        Ok(probe_private_selectors(&reminder))
+        let obj =
+            unsafe { &*(&*reminder as *const EKReminder).cast::<objc2::runtime::AnyObject>() };
+        Ok(probe_private_selectors(obj, "EKReminder"))
     }
 
     // ========================================================================
@@ -897,14 +1147,14 @@ impl RemindersManager {
 
     /// Lists all alarms on a reminder.
     pub fn get_alarms(&self, identifier: &str) -> Result<Vec<AlarmInfo>> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         Ok(get_item_alarms(&reminder))
     }
 
     /// Adds an alarm to a reminder.
     pub fn add_alarm(&self, identifier: &str, alarm: &AlarmInfo) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         add_item_alarm(&reminder, alarm)?;
         self.save_reminder_and_refresh(&reminder)?;
@@ -913,7 +1163,7 @@ impl RemindersManager {
 
     /// Removes all alarms from a reminder.
     pub fn remove_all_alarms(&self, identifier: &str) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         clear_item_alarms(&reminder);
         self.save_reminder_and_refresh(&reminder)?;
@@ -922,7 +1172,7 @@ impl RemindersManager {
 
     /// Removes a specific alarm from a reminder by index.
     pub fn remove_alarm(&self, identifier: &str, index: usize) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         remove_item_alarm(&reminder, index)?;
         self.save_reminder_and_refresh(&reminder)?;
@@ -936,7 +1186,7 @@ impl RemindersManager {
     /// Set or clear the URL on a reminder.
     #[allow(non_snake_case)]
     pub fn set_URL(&self, identifier: &str, url: Option<&str>) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         set_item_URL(&reminder, url)?;
         self.save_reminder_and_refresh(&reminder)?;
@@ -945,7 +1195,7 @@ impl RemindersManager {
 
     /// Set or clear the free-text `location` on a reminder.
     pub fn set_location(&self, identifier: &str, location: Option<&str>) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         set_item_location(&reminder, location);
         self.save_reminder_and_refresh(&reminder)?;
@@ -955,7 +1205,7 @@ impl RemindersManager {
     /// Set or clear `EKReminder.dueDateTimeZone`. `tz_name` must be an
     /// IANA zone identifier (e.g. `"America/Los_Angeles"`).
     pub fn set_due_date_timezone(&self, identifier: &str, tz_name: Option<&str>) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         set_reminder_due_date_timezone(&reminder, tz_name);
         self.save_reminder_and_refresh(&reminder)?;
@@ -977,7 +1227,7 @@ impl RemindersManager {
         identifier: &str,
         loc: Option<&StructuredLocation>,
     ) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         set_reminder_structured_location(&reminder, loc);
         self.save_reminder_and_refresh(&reminder)?;
@@ -995,7 +1245,7 @@ impl RemindersManager {
         identifier: &str,
         geofence: Option<(&StructuredLocation, AlarmProximity)>,
     ) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
 
         // Prompt for location auth before saving a geofence. Without this we
         // would silently create a reminder whose proximity trigger can't fire.
@@ -1032,14 +1282,14 @@ impl RemindersManager {
 
     /// Gets recurrence rules on a reminder.
     pub fn get_recurrence_rules(&self, identifier: &str) -> Result<Vec<RecurrenceRule>> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         Ok(get_item_recurrence_rules(&reminder))
     }
 
     /// Sets a recurrence rule on a reminder (replaces any existing rules).
     pub fn set_recurrence_rule(&self, identifier: &str, rule: &RecurrenceRule) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         set_item_recurrence_rule(&reminder, rule);
         self.save_reminder_and_refresh(&reminder)?;
@@ -1048,7 +1298,7 @@ impl RemindersManager {
 
     /// Removes all recurrence rules from a reminder.
     pub fn remove_recurrence_rules(&self, identifier: &str) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let reminder = self.find_reminder_by_id(identifier)?;
         clear_item_recurrence_rules(&reminder);
         self.save_reminder_and_refresh(&reminder)?;
@@ -1063,7 +1313,7 @@ impl RemindersManager {
     ///
     /// The list will be created in the default source (usually iCloud or Local).
     pub fn create_calendar(&self, title: &str) -> Result<CalendarInfo> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
 
         // Create a new calendar for reminders
         let calendar = unsafe {
@@ -1101,7 +1351,7 @@ impl RemindersManager {
         new_title: Option<&str>,
         color_rgba: Option<(f64, f64, f64, f64)>,
     ) -> Result<CalendarInfo> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let calendar = self.find_calendar_by_id(identifier)?;
 
         if !unsafe { calendar.allowsContentModifications() } {
@@ -1133,7 +1383,7 @@ impl RemindersManager {
     ///
     /// Warning: This will delete all reminders in the list!
     pub fn delete_calendar(&self, identifier: &str) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
 
         let calendar = self.find_calendar_by_id(identifier)?;
 
@@ -1155,7 +1405,7 @@ impl RemindersManager {
 
     /// Gets a calendar by its identifier
     pub fn get_calendar(&self, identifier: &str) -> Result<CalendarInfo> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let calendar = self.find_calendar_by_id(identifier)?;
         Ok(calendar_to_info(&calendar))
     }
@@ -1294,6 +1544,87 @@ impl std::fmt::Display for AuthorizationStatus {
             AuthorizationStatus::Denied => write!(f, "Denied"),
             AuthorizationStatus::FullAccess => write!(f, "Full Access"),
             AuthorizationStatus::WriteOnly => write!(f, "Write Only"),
+        }
+    }
+}
+
+/// The access level an operation needs.
+///
+/// Apple does not offer a read-only tier: *"Your app can't request read-only
+/// access to either events or reminders. To read events or reminders from the
+/// event store, your app needs full access."* So every read/list/search/update/
+/// delete path is [`AccessNeed::Full`], and only genuine create-only paths can
+/// settle for [`AccessNeed::Write`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessNeed {
+    /// Any path that READS the store — list, get, search, update, delete.
+    Full,
+    /// Create-only paths, which a write-only grant satisfies.
+    Write,
+}
+
+/// Why an authorization check refused.
+///
+/// Distinguished because the REMEDY differs: a write-only user must grant full
+/// access in System Settings, which is a different instruction from "you denied
+/// us". Collapsing these into one error is what makes the failure unactionable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthRefusal {
+    /// The user explicitly denied access.
+    Denied,
+    /// System policy (MDM, Screen Time) forbids access.
+    Restricted,
+    /// Write-only granted, but the operation needs to READ.
+    WriteOnly,
+}
+
+/// The conclusion of an authorization check, BEFORE any side effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthVerdict {
+    /// The current grant covers this operation — proceed.
+    Allowed,
+    /// Undecided; the caller must prompt the user, then re-check.
+    MustRequest,
+    /// Refuse, with the reason the caller maps to an error.
+    Refused(AuthRefusal),
+}
+
+/// Decide whether `status` permits an operation needing `need`.
+///
+/// **This is the testability seam.**
+/// `EKEventStore::authorizationStatusForEntityType` is a CLASS method reading
+/// process-global TCC state, so a test that goes through it takes a different
+/// branch on a machine with Calendar granted than it does on CI. Taking the
+/// status as a PARAMETER lets tests drive all five values with no EventKit, no
+/// store construction, and no dependence on the host's privacy settings.
+///
+/// The load-bearing case is `WriteOnly` + [`AccessNeed::Full`]. Apple:
+/// *"Your app can create events, but it can't access any of the existing
+/// calendars and events on the device, including events your app created. API
+/// calls to read event data from the event store don't return any events."*
+/// Returning `Allowed` there does not fail — it succeeds and returns nothing,
+/// so the caller reports an empty calendar that is indistinguishable from a
+/// genuinely empty one. That is why this refuses instead.
+pub fn authorization_verdict(need: AccessNeed, status: AuthorizationStatus) -> AuthVerdict {
+    match (need, status) {
+        (_, AuthorizationStatus::FullAccess) => AuthVerdict::Allowed,
+        (AccessNeed::Write, AuthorizationStatus::WriteOnly) => AuthVerdict::Allowed,
+        (AccessNeed::Full, AuthorizationStatus::WriteOnly) => {
+            AuthVerdict::Refused(AuthRefusal::WriteOnly)
+        }
+        (_, AuthorizationStatus::NotDetermined) => AuthVerdict::MustRequest,
+        (_, AuthorizationStatus::Denied) => AuthVerdict::Refused(AuthRefusal::Denied),
+        (_, AuthorizationStatus::Restricted) => AuthVerdict::Refused(AuthRefusal::Restricted),
+    }
+}
+
+impl AuthRefusal {
+    /// Map a refusal to the error the caller returns.
+    fn into_error(self) -> EventKitError {
+        match self {
+            AuthRefusal::Denied => EventKitError::AuthorizationDenied,
+            AuthRefusal::Restricted => EventKitError::AuthorizationRestricted,
+            AuthRefusal::WriteOnly => EventKitError::AuthorizationWriteOnly,
         }
     }
 }
@@ -1448,13 +1779,49 @@ fn reflect_object_full<T: Message>(header: &str, obj: &T, read_values: bool) -> 
 /// based on Apple's public naming patterns and what Reminders.app surfaces.
 /// Add entries as new candidates come up; the cost of an extra probe is one
 /// caught NSException.
-fn probe_private_selectors(reminder: &EKReminder) -> String {
+/// Probe an `EKCalendarItem` subclass (reminder OR event) for undocumented
+/// selectors, reporting each result's Objective-C CLASS.
+///
+/// `label` names the class in the report header. The class of each returned
+/// value is what makes this useful: if a rich-notes property existed, its
+/// value would come back as `NSAttributedString` / `NSConcreteAttributedString`
+/// rather than `__NSCFString`.
+fn probe_private_selectors(item: &objc2::runtime::AnyObject, label: &str) -> String {
     use objc2::msg_send;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, Sel};
     use std::ffi::CString;
 
     const PROBES: &[&str] = &[
+        // ── Rich / attributed NOTES candidates ───────────────────────────
+        //
+        // The PUBLIC API has no rich-text notes: Apple's "Attaching Notes"
+        // topic on EKCalendarItem is exactly two members (`notes`, `hasNotes`)
+        // and `notes` is a plain `NSString`. A search of EventKit AND
+        // EventKitUI for NSAttributedString/RTF returns nothing. These probes
+        // exist to test whether a PRIVATE one is hiding behind the frozen
+        // wrapper or on the backing persistent object.
+        //
+        // Read the reported [ClassName]: a plain-text field comes back as
+        // `__NSCFString`/`NSTaggedPointerString`. Anything answering with
+        // `NSAttributedString`, `NSConcreteAttributedString`, or `NSData`
+        // holding RTF would be the find.
+        "notes", // baseline — confirms what the PUBLIC field's class is
+        "attributedNotes",
+        "notesAttributed",
+        "attributedDescription",
+        "attributedTitle",
+        "richNotes",
+        "styledNotes",
+        "formattedNotes",
+        "markedUpNotes",
+        "notesRTF",
+        "notesRTFData",
+        "rtfNotes",
+        "notesData",
+        "notesHTML",
+        "htmlNotes",
+        "bodyAttributedString",
         // Rich-link / preview URL candidates
         "appLink",      // <- confirmed exists on EKCalendarItem (method dump)
         "URLString",    // <- confirmed exists on EKCalendarItem
@@ -1509,8 +1876,8 @@ fn probe_private_selectors(reminder: &EKReminder) -> String {
         "childReminders",
     ];
 
-    let obj: &AnyObject = unsafe { &*(reminder as *const EKReminder as *const AnyObject) };
-    let mut out = String::from("=== Private-selector probe on EKReminder ===\n");
+    let obj: &AnyObject = item;
+    let mut out = format!("=== Private-selector probe on {label} ===\n");
     out.push_str("(each call wrapped in @try/@catch — caught exceptions mean the selector doesn't exist on this class)\n\n");
 
     for name in PROBES {
@@ -2197,9 +2564,16 @@ pub struct EventsManager {
 }
 
 impl EventsManager {
-    /// Creates a new EventsManager instance
+    /// Creates a new EventsManager instance.
+    ///
+    /// Cheap — see [`RemindersManager::new`] and the private `StoreCache`.
     pub fn new() -> Self {
-        let store = unsafe { EKEventStore::new() };
+        let store = EVENT_STORE.with(|cell| {
+            cell.borrow_mut()
+                .get_or_insert_with(StoreCache::build)
+                .store
+                .clone()
+        });
         Self { store }
     }
 
@@ -2225,7 +2599,7 @@ impl EventsManager {
             };
 
             let (lock, cvar) = &*result_clone;
-            let mut res = lock.lock().unwrap();
+            let mut res = lock.lock();
             *res = Some((granted.as_bool(), error_msg));
             cvar.notify_one();
         });
@@ -2237,9 +2611,11 @@ impl EventsManager {
         }
 
         let (lock, cvar) = &*result;
-        let mut res = lock.lock().unwrap();
-        while res.is_none() {
-            res = cvar.wait(res).unwrap();
+        let mut res = lock.lock();
+        if !wait_for_completion(cvar, &mut res, AUTHORIZATION_TIMEOUT) {
+            return Err(EventKitError::AuthorizationRequestFailed(
+                "timed out waiting for the system authorization response".to_string(),
+            ));
         }
 
         match res.take() {
@@ -2251,26 +2627,57 @@ impl EventsManager {
         }
     }
 
-    /// Ensures we have authorization, requesting if needed
-    pub fn ensure_authorized(&self) -> Result<()> {
-        match Self::authorization_status() {
-            AuthorizationStatus::FullAccess => Ok(()),
-            AuthorizationStatus::NotDetermined => {
-                if self.request_access()? {
-                    Ok(())
-                } else {
-                    Err(EventKitError::AuthorizationDenied)
+    /// Resolve an authorization check for `need`, prompting once if the user
+    /// has not decided yet. See `RemindersManager::ensure_access`.
+    fn ensure_access(&self, need: AccessNeed) -> Result<()> {
+        let status = Self::authorization_status();
+        Self::reconcile_store(status);
+        match authorization_verdict(need, status) {
+            AuthVerdict::Allowed => Ok(()),
+            AuthVerdict::Refused(refusal) => Err(refusal.into_error()),
+            AuthVerdict::MustRequest => {
+                self.request_access()?;
+                let status = Self::authorization_status();
+                Self::reconcile_store(status);
+                match authorization_verdict(need, status) {
+                    AuthVerdict::Allowed => Ok(()),
+                    AuthVerdict::Refused(refusal) => Err(refusal.into_error()),
+                    AuthVerdict::MustRequest => Err(EventKitError::AuthorizationDenied),
                 }
             }
-            AuthorizationStatus::Denied => Err(EventKitError::AuthorizationDenied),
-            AuthorizationStatus::Restricted => Err(EventKitError::AuthorizationRestricted),
-            AuthorizationStatus::WriteOnly => Ok(()),
         }
+    }
+
+    /// Reset this thread's cached store if the grant changed since last use.
+    /// See `RemindersManager::reconcile_store` and [`StoreCache::reconcile`].
+    fn reconcile_store(status: AuthorizationStatus) {
+        EVENT_STORE.with(|cell| {
+            if let Some(cache) = cell.borrow_mut().as_mut() {
+                cache.reconcile(status);
+            }
+        });
+    }
+
+    /// Full access — required for ANY read/list/search/update/delete path.
+    ///
+    /// `WriteOnly` is an ERROR here, and for events this arm is LIVE (unlike
+    /// reminders, events really do have a write-only tier). Apple:
+    /// *"Your app can create events, but it can't access any of the existing
+    /// calendars and events on the device, including events your app created.
+    /// API calls to read event data from the event store don't return any
+    /// events."* Allowing the call would report an empty calendar.
+    pub fn ensure_full_access(&self) -> Result<()> {
+        self.ensure_access(AccessNeed::Full)
+    }
+
+    /// Create-only paths. Both `FullAccess` and `WriteOnly` satisfy this.
+    pub fn ensure_write_access(&self) -> Result<()> {
+        self.ensure_access(AccessNeed::Write)
     }
 
     /// Lists all event calendars
     pub fn list_calendars(&self) -> Result<Vec<CalendarInfo>> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
 
         let calendars = unsafe { self.store.calendarsForEntityType(EKEntityType::Event) };
 
@@ -2284,7 +2691,7 @@ impl EventsManager {
 
     /// Gets the default calendar for new events
     pub fn default_calendar(&self) -> Result<CalendarInfo> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
 
         let calendar = unsafe { self.store.defaultCalendarForNewEvents() };
 
@@ -2321,7 +2728,7 @@ impl EventsManager {
         end: DateTime<Local>,
         calendar_titles: Option<&[&str]>,
     ) -> Result<Vec<EventItem>> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
 
         if start >= end {
             return Err(EventKitError::InvalidDateRange);
@@ -2379,7 +2786,13 @@ impl EventsManager {
     /// `title`, `start`, and `end` are required; spread `..Default::default()`
     /// for the rest.
     pub fn create_event(&self, draft: &EventDraft<'_>) -> Result<EventItem> {
-        self.ensure_authorized()?;
+        // See `RemindersManager::create_reminder` — write-only covers a
+        // default-calendar create, but not a by-title lookup.
+        if draft.calendar_title.is_some() {
+            self.ensure_full_access()?;
+        } else {
+            self.ensure_write_access()?;
+        }
 
         let start = draft.start.ok_or(EventKitError::InvalidDateRange)?;
         let end = draft.end.ok_or(EventKitError::InvalidDateRange)?;
@@ -2440,7 +2853,7 @@ impl EventsManager {
     /// whether the edit applies to just this occurrence or all future
     /// occurrences in a recurring series.
     pub fn update_event(&self, identifier: &str, patch: &EventPatch<'_>) -> Result<EventItem> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
 
         let event = self.find_event_by_id(identifier)?;
 
@@ -2498,7 +2911,7 @@ impl EventsManager {
 
     /// Deletes an event
     pub fn delete_event(&self, identifier: &str, affect_future: bool) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
 
         let event = self.find_event_by_id(identifier)?;
         let span = if affect_future {
@@ -2518,9 +2931,31 @@ impl EventsManager {
 
     /// Gets an event by its identifier
     pub fn get_event(&self, identifier: &str) -> Result<EventItem> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let event = self.find_event_by_id(identifier)?;
         Ok(event_to_item(&event))
+    }
+
+    /// Probe an EVENT for undocumented Objective-C selectors, reporting the
+    /// CLASS of every value returned.
+    ///
+    /// The reminders counterpart of this is
+    /// [`RemindersManager::dump_reminder_private`]; both share one probe list
+    /// so a finding on either class surfaces on both.
+    ///
+    /// Primary use today: settling whether a PRIVATE rich-notes property
+    /// exists. The public API has none — `EKCalendarItem`'s entire "Attaching
+    /// Notes" surface is `notes: NSString?` plus `hasNotes: Bool` — so the
+    /// probe includes `notes` itself as a BASELINE. Compare the class it
+    /// reports (expect `__NSCFString` / `NSTaggedPointerString`) against any
+    /// `attributedNotes`-style hit; only a value whose class is
+    /// `NSAttributedString`/`NSConcreteAttributedString`, or `NSData` carrying
+    /// RTF, would mean rich text is reachable at all.
+    pub fn dump_event_private(&self, identifier: &str) -> Result<String> {
+        self.ensure_full_access()?;
+        let event = self.find_event_by_id(identifier)?;
+        let obj = unsafe { &*(&*event as *const EKEvent).cast::<objc2::runtime::AnyObject>() };
+        Ok(probe_private_selectors(obj, "EKEvent"))
     }
 
     // ========================================================================
@@ -2529,7 +2964,7 @@ impl EventsManager {
 
     /// Creates a new event calendar.
     pub fn create_event_calendar(&self, title: &str) -> Result<CalendarInfo> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let calendar = unsafe {
             EKCalendar::calendarForEntityType_eventStore(EKEntityType::Event, &self.store)
         };
@@ -2564,7 +2999,7 @@ impl EventsManager {
         new_title: Option<&str>,
         color_rgba: Option<(f64, f64, f64, f64)>,
     ) -> Result<CalendarInfo> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let calendar = unsafe {
             self.store
                 .calendarWithIdentifier(&NSString::from_str(identifier))
@@ -2591,7 +3026,7 @@ impl EventsManager {
 
     /// Deletes an event calendar.
     pub fn delete_event_calendar(&self, identifier: &str) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let calendar = unsafe {
             self.store
                 .calendarWithIdentifier(&NSString::from_str(identifier))
@@ -2612,14 +3047,14 @@ impl EventsManager {
 
     /// Lists all alarms on an event.
     pub fn get_event_alarms(&self, identifier: &str) -> Result<Vec<AlarmInfo>> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let event = self.find_event_by_id(identifier)?;
         Ok(get_item_alarms(&event))
     }
 
     /// Adds an alarm to an event.
     pub fn add_event_alarm(&self, identifier: &str, alarm: &AlarmInfo) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let event = self.find_event_by_id(identifier)?;
         add_item_alarm(&event, alarm)?;
         self.save_event_and_refresh(&event, EKSpan::ThisEvent)?;
@@ -2632,14 +3067,14 @@ impl EventsManager {
 
     /// Gets recurrence rules on an event.
     pub fn get_event_recurrence_rules(&self, identifier: &str) -> Result<Vec<RecurrenceRule>> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let event = self.find_event_by_id(identifier)?;
         Ok(get_item_recurrence_rules(&event))
     }
 
     /// Sets a recurrence rule on an event (replaces any existing rules).
     pub fn set_event_recurrence_rule(&self, identifier: &str, rule: &RecurrenceRule) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let event = self.find_event_by_id(identifier)?;
         set_item_recurrence_rule(&event, rule);
         self.save_event_and_refresh(&event, EKSpan::ThisEvent)?;
@@ -2648,7 +3083,7 @@ impl EventsManager {
 
     /// Removes all recurrence rules from an event.
     pub fn remove_event_recurrence_rules(&self, identifier: &str) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let event = self.find_event_by_id(identifier)?;
         clear_item_recurrence_rules(&event);
         self.save_event_and_refresh(&event, EKSpan::ThisEvent)?;
@@ -2657,7 +3092,7 @@ impl EventsManager {
 
     /// Removes a specific alarm from an event by index.
     pub fn remove_event_alarm(&self, identifier: &str, index: usize) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let event = self.find_event_by_id(identifier)?;
         remove_item_alarm(&event, index)?;
         self.save_event_and_refresh(&event, EKSpan::ThisEvent)?;
@@ -2667,7 +3102,7 @@ impl EventsManager {
     /// Set or clear the URL on an event.
     #[allow(non_snake_case)]
     pub fn set_event_URL(&self, identifier: &str, url: Option<&str>) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let event = self.find_event_by_id(identifier)?;
         set_item_URL(&event, url)?;
         self.save_event_and_refresh(&event, EKSpan::ThisEvent)?;
@@ -2682,7 +3117,7 @@ impl EventsManager {
         identifier: &str,
         availability: EventAvailability,
     ) -> Result<()> {
-        self.ensure_authorized()?;
+        self.ensure_full_access()?;
         let event = self.find_event_by_id(identifier)?;
         unsafe { event.setAvailability(availability.to_ek()) };
         self.save_event_and_refresh(&event, EKSpan::ThisEvent)
@@ -3461,6 +3896,314 @@ mod tests {
         assert_eq!(
             format!("{}", AuthorizationStatus::FullAccess),
             "Full Access"
+        );
+    }
+
+    // ── Authorization decision seam ──────────────────────────────────────
+    //
+    // `authorization_verdict` takes the status as a PARAMETER precisely so
+    // these run identically on a granted dev machine and on CI. Every one of
+    // the five statuses is covered for both access needs.
+
+    /// THE regression guard. A write-only grant must REFUSE a read, because
+    /// Apple returns no events at all to a write-only client — so `Allowed`
+    /// here produces `Ok(vec![])` and the model tells the user their calendar
+    /// is empty when it simply lacks permission. Assert on the refusal, since
+    /// silent success is exactly the bug.
+    #[test]
+    fn write_only_refuses_reads_never_silently_allows() {
+        assert_eq!(
+            authorization_verdict(AccessNeed::Full, AuthorizationStatus::WriteOnly),
+            AuthVerdict::Refused(AuthRefusal::WriteOnly),
+            "write-only must ERROR on a read path, not return an empty list"
+        );
+    }
+
+    /// ...but a write-only grant still satisfies a create-only path.
+    #[test]
+    fn write_only_allows_writes() {
+        assert_eq!(
+            authorization_verdict(AccessNeed::Write, AuthorizationStatus::WriteOnly),
+            AuthVerdict::Allowed
+        );
+    }
+
+    #[test]
+    fn full_access_allows_both_needs() {
+        assert_eq!(
+            authorization_verdict(AccessNeed::Full, AuthorizationStatus::FullAccess),
+            AuthVerdict::Allowed
+        );
+        assert_eq!(
+            authorization_verdict(AccessNeed::Write, AuthorizationStatus::FullAccess),
+            AuthVerdict::Allowed
+        );
+    }
+
+    #[test]
+    fn not_determined_requests_for_both_needs() {
+        for need in [AccessNeed::Full, AccessNeed::Write] {
+            assert_eq!(
+                authorization_verdict(need, AuthorizationStatus::NotDetermined),
+                AuthVerdict::MustRequest,
+                "{need:?} must prompt, not decide"
+            );
+        }
+    }
+
+    #[test]
+    fn denied_and_restricted_refuse_for_both_needs() {
+        for need in [AccessNeed::Full, AccessNeed::Write] {
+            assert_eq!(
+                authorization_verdict(need, AuthorizationStatus::Denied),
+                AuthVerdict::Refused(AuthRefusal::Denied),
+                "{need:?} + Denied"
+            );
+            assert_eq!(
+                authorization_verdict(need, AuthorizationStatus::Restricted),
+                AuthVerdict::Refused(AuthRefusal::Restricted),
+                "{need:?} + Restricted"
+            );
+        }
+    }
+
+    /// The three refusals must stay DISTINCT errors — a write-only user needs
+    /// "grant full access", not "you denied us".
+    #[test]
+    fn refusals_map_to_distinct_errors() {
+        assert!(matches!(
+            AuthRefusal::WriteOnly.into_error(),
+            EventKitError::AuthorizationWriteOnly
+        ));
+        assert!(matches!(
+            AuthRefusal::Denied.into_error(),
+            EventKitError::AuthorizationDenied
+        ));
+        assert!(matches!(
+            AuthRefusal::Restricted.into_error(),
+            EventKitError::AuthorizationRestricted
+        ));
+    }
+
+    // ── Store cache / reset-on-transition ────────────────────────────────
+    //
+    // `StoreCache::reconcile` is tested through a decision helper rather than
+    // a real `EKEventStore`, for the same reason as the verdict table: a real
+    // store needs live TCC state. What matters is WHEN we reset, and that is
+    // pure logic over (previous, current).
+
+    /// THE coupling guard. Caching the store without resetting it on a grant
+    /// transition reintroduces silently-empty results by a different route: a
+    /// user who grants access mid-session keeps getting nothing until restart.
+    /// This is the test that fails if someone removes the `reset()`.
+    #[test]
+    fn grant_transition_resets_the_cached_store() {
+        assert!(
+            needs_store_reset(
+                Some(AuthorizationStatus::NotDetermined),
+                AuthorizationStatus::FullAccess
+            ),
+            "NotDetermined → FullAccess MUST reset, or reads stay empty after the grant"
+        );
+        assert!(
+            needs_store_reset(
+                Some(AuthorizationStatus::WriteOnly),
+                AuthorizationStatus::FullAccess
+            ),
+            "WriteOnly → FullAccess MUST reset"
+        );
+        assert!(
+            needs_store_reset(
+                Some(AuthorizationStatus::Denied),
+                AuthorizationStatus::FullAccess
+            ),
+            "Denied → FullAccess MUST reset"
+        );
+    }
+
+    /// `reset()` discards uncommitted changes, so it must NOT fire when the
+    /// grant is unchanged — that would silently drop a caller's in-flight edits.
+    #[test]
+    fn unchanged_status_does_not_reset() {
+        for status in [
+            AuthorizationStatus::FullAccess,
+            AuthorizationStatus::WriteOnly,
+            AuthorizationStatus::Denied,
+            AuthorizationStatus::Restricted,
+            AuthorizationStatus::NotDetermined,
+        ] {
+            assert!(
+                !needs_store_reset(Some(status), status),
+                "{status:?} unchanged must NOT reset (it discards uncommitted changes)"
+            );
+        }
+    }
+
+    /// First use on a thread has read nothing yet, so there is no stale state
+    /// to clear — resetting a brand-new store is pure overhead.
+    #[test]
+    fn first_use_does_not_reset() {
+        for status in [
+            AuthorizationStatus::FullAccess,
+            AuthorizationStatus::NotDetermined,
+        ] {
+            assert!(!needs_store_reset(None, status), "first use of {status:?}");
+        }
+    }
+
+    /// Constructing a manager must not touch ANY EventKit accessor.
+    ///
+    /// Regression guard. `objc2` declares most `EKEventStore` accessors
+    /// non-null, but they return NULL to an unauthorized process, which aborts
+    /// the thread. An `eventStoreIdentifier()` call in `StoreCache::build`
+    /// panicked before `ensure_full_access` could run, so `request_access()`
+    /// never fired and no TCC consent dialog ever appeared.
+    ///
+    /// This test can only prove construction is panic-free on THIS host (which
+    /// may be authorized); the real protection is the rule documented on
+    /// `StoreCache::build`. Keep construction inert.
+    #[test]
+    fn constructing_a_manager_touches_no_eventkit_accessor() {
+        let _ = RemindersManager::new();
+        let _ = EventsManager::new();
+        // Reaching here means neither constructor aborted.
+    }
+
+    /// A manager construction must REUSE the thread's store, not build a new
+    /// one — that is the whole point of the cache. Asserting on pointer
+    /// identity rather than timing keeps it deterministic.
+    #[test]
+    fn managers_reuse_one_store_per_thread() {
+        let a = RemindersManager::new();
+        let b = RemindersManager::new();
+        assert!(
+            std::ptr::eq(&*a.store, &*b.store),
+            "repeated RemindersManager::new() must retain ONE cached EKEventStore"
+        );
+
+        let c = EventsManager::new();
+        let d = EventsManager::new();
+        assert!(
+            std::ptr::eq(&*c.store, &*d.store),
+            "repeated EventsManager::new() must retain ONE cached EKEventStore"
+        );
+    }
+
+    // ── Completion-block timeouts ────────────────────────────────────────
+    //
+    // `wait_for_completion` is the guard against a permanent worker-thread
+    // wedge: every EventKit call in this file parks a thread until an Obj-C
+    // block fires, and a block that never fires used to park it forever. The
+    // helper takes a plain `Condvar`, so the timeout is testable with no
+    // EventKit and no TCC state — which matters, because the failure it exists
+    // to prevent only reproduces on a host that can't answer a consent dialog.
+
+    /// A completion that NEVER fires must give up, not park forever.
+    #[test]
+    fn wait_for_completion_gives_up_when_nothing_arrives() {
+        let lock = Mutex::new(None::<u8>);
+        let cvar = Condvar::new();
+        let mut guard = lock.lock();
+
+        let start = std::time::Instant::now();
+        let arrived = wait_for_completion(&cvar, &mut guard, std::time::Duration::from_millis(150));
+        let waited = start.elapsed();
+
+        assert!(!arrived, "must report timeout, not a phantom completion");
+        assert!(guard.is_none(), "the slot must be left untouched");
+        assert!(
+            waited >= std::time::Duration::from_millis(150),
+            "must actually wait the full budget, waited {waited:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "must not park past the budget, waited {waited:?}"
+        );
+    }
+
+    /// The happy path still works: a block that fires wakes the waiter and its
+    /// value is delivered. Without this, a timeout that always returned false
+    /// would pass the test above.
+    #[test]
+    fn wait_for_completion_returns_the_value_a_block_publishes() {
+        let pair = Arc::new((Mutex::new(None::<u8>), Condvar::new()));
+        let writer = Arc::clone(&pair);
+
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let (lock, cvar) = &*writer;
+            *lock.lock() = Some(7);
+            cvar.notify_one();
+        });
+
+        let (lock, cvar) = &*pair;
+        let mut guard = lock.lock();
+        let arrived = wait_for_completion(cvar, &mut guard, std::time::Duration::from_secs(5));
+
+        assert!(arrived, "a completion that fires must be observed");
+        assert_eq!(guard.take(), Some(7));
+    }
+
+    /// A value already in the slot must return immediately — the loop condition
+    /// is checked before waiting, so this must not depend on a notification
+    /// that already came and went.
+    #[test]
+    fn wait_for_completion_does_not_wait_on_an_already_full_slot() {
+        let lock = Mutex::new(Some(1u8));
+        let cvar = Condvar::new();
+        let mut guard = lock.lock();
+
+        let start = std::time::Instant::now();
+        // A long budget: if this consulted the condvar it would hang here.
+        let arrived = wait_for_completion(&cvar, &mut guard, std::time::Duration::from_secs(30));
+
+        assert!(arrived);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "must return immediately when the slot is already full"
+        );
+    }
+
+    /// EXACTLY ONE place in this file may construct a store.
+    ///
+    /// This guards the outage that shipped before the cache existed: both
+    /// manager constructors built a store unconditionally, and `mcp.rs` builds a
+    /// manager per tool call, so a busy session allocated one store per call
+    /// until the calendar daemon cut the process off with
+    /// `EKCADErrorDomain 1021 — "This process has too many EKEventStore
+    /// instances. Use fewer event stores."`
+    ///
+    /// The fix routes every construction through `StoreCache::build`, behind the
+    /// per-thread caches. A second construction site anywhere in this file would
+    /// quietly restore the old behaviour, and no behavioural test would notice:
+    /// exhaustion needs enough LIVE stores to trip a process-wide daemon limit,
+    /// which no unit test creates and CI would never reach. The source itself is
+    /// the only thing that can be asserted on cheaply.
+    ///
+    /// The needle is split so this test cannot match itself.
+    #[test]
+    fn only_one_place_constructs_a_store() {
+        let needle = concat!("EKEventStore", "::new()");
+        let hits = include_str!("imp.rs").matches(needle).count();
+        assert_eq!(
+            hits, 1,
+            "expected exactly ONE construction site (StoreCache::build), found {hits}. \
+             Every store must come from the per-thread cache — see StoreCache."
+        );
+    }
+
+    /// The write-only error text must name FULL access — the app surfaces this
+    /// string, and "denied" would send the user to the wrong remedy.
+    #[test]
+    fn write_only_error_names_full_access() {
+        let msg = EventKitError::AuthorizationWriteOnly.to_string();
+        assert!(
+            msg.to_lowercase().contains("full access"),
+            "must tell the user to grant FULL access, got: {msg}"
+        );
+        assert!(
+            msg.contains("System Settings"),
+            "must name where to fix it, got: {msg}"
         );
     }
 

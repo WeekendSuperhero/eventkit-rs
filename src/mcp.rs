@@ -5,12 +5,19 @@
 //!
 //! This module is gated behind the `mcp` feature flag.
 
+// `RoleServer` / `service::RequestContext` are NOT imported: since rmcp-macros
+// 2.x (#866) the `#[prompt_handler]` / `#[tool_handler]` expansions name those
+// types with fully qualified paths, so they no longer have to be in scope.
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServiceExt, handler::server::wrapper::Parameters, model::*,
-    prompt, prompt_handler, prompt_router, schemars, schemars::JsonSchema, service::RequestContext,
-    tool, tool_handler, tool_router, transport::stdio,
+    ErrorData as McpError, ServiceExt, handler::server::wrapper::Parameters, model::*, prompt,
+    prompt_handler, prompt_router, schemars, schemars::JsonSchema, tool, tool_handler, tool_router,
+    transport::stdio,
 };
 use serde::{Deserialize, Serialize};
+
+#[path = "mcp_tasks.rs"]
+mod tasks;
+use tasks::{ManagedTask, TaskCompletion, TaskFailureGuard, TaskManager};
 
 use crate::{AuthorizationStatus, EventsManager, RemindersManager};
 use chrono::{DateTime, Duration, Local, NaiveDateTime, TimeZone};
@@ -37,6 +44,17 @@ fn mcp_err(e: &crate::EventKitError) -> McpError {
         }
         AuthorizationRestricted => {
             "Reminders/Calendar access is restricted by system policy (MDM or parental controls)."
+                .to_string()
+        }
+        AuthorizationWriteOnly => {
+            // NAME FULL ACCESS explicitly. "Denied" would send the user to the
+            // wrong remedy: they DID grant something, just not enough. Apple
+            // returns no events at all to a write-only client, so without this
+            // error the tool would have answered with an empty calendar.
+            "Only WRITE-ONLY Calendar access was granted, which cannot read anything — \
+             Apple returns no events to a write-only client, not even ones this app created. \
+             Open System Settings → Privacy & Security → Calendars and grant FULL access \
+             for `eventkit`. Call `auth_status` to see the current state."
                 .to_string()
         }
         AuthorizationNotDetermined => {
@@ -224,18 +242,21 @@ fn auth_status_str(s: AuthorizationStatus) -> &'static str {
 }
 
 fn auth_remediation(reminders: AuthorizationStatus, events: AuthorizationStatus) -> Option<String> {
-    let granted = |s| {
-        matches!(
-            s,
-            AuthorizationStatus::FullAccess | AuthorizationStatus::WriteOnly
-        )
-    };
+    // ONLY FullAccess counts as granted. `WriteOnly` used to be treated as
+    // granted here, which meant a write-only user was told everything was
+    // fine while every read silently returned nothing — the same defect as
+    // the old `WriteOnly => Ok(())` in `ensure_authorized`, surfacing at the
+    // `auth_status` tool instead of the read path.
+    let granted = |s| matches!(s, AuthorizationStatus::FullAccess);
     if granted(reminders) && granted(events) {
         return None;
     }
     let worst = |s| match s {
-        AuthorizationStatus::Denied => 3,
-        AuthorizationStatus::Restricted => 2,
+        AuthorizationStatus::Denied => 4,
+        AuthorizationStatus::Restricted => 3,
+        // Above NotDetermined: the user already engaged with the prompt, so
+        // the actionable fix is a specific Settings change, not "try again".
+        AuthorizationStatus::WriteOnly => 2,
         AuthorizationStatus::NotDetermined => 1,
         _ => 0,
     };
@@ -263,7 +284,14 @@ fn auth_remediation(reminders: AuthorizationStatus, events: AuthorizationStatus)
              override this from System Settings — an administrator must change the policy."
                 .into()
         }
-        _ => "Authorization is partially granted; one of reminders/events is not in FullAccess/WriteOnly state.".into(),
+        AuthorizationStatus::WriteOnly => {
+            "Only WRITE-ONLY access was granted. Apple returns no events or reminders at all \
+             to a write-only client, so reads would come back empty rather than fail. Open \
+             System Settings → Privacy & Security → Calendars (and/or Reminders) and grant \
+             FULL access for `eventkit`."
+                .into()
+        }
+        _ => "Authorization is partially granted; one of reminders/events is not in FullAccess state.".into(),
     })
 }
 
@@ -1200,10 +1228,39 @@ pub struct CreateReminderPromptArgs {
 /// but every handler in this module keeps those values stack-local and never holds
 /// one across an `.await`. That makes the generated handler futures `Send`, so the
 /// server can run on a normal multi-thread tokio runtime without rmcp's `local`
-/// feature. New handlers MUST preserve this invariant — if you need async work,
-/// wrap the synchronous EventKit calls in `tokio::task::spawn_blocking` so the
-/// `!Send` value lives entirely inside the blocking closure.
-pub struct EventKitServer {}
+/// feature. New handlers MUST preserve this invariant.
+///
+/// **Never reach for `tokio::task::spawn_blocking` to satisfy it.** Doing so
+/// looks right — the `!Send` value would live entirely inside the closure — but
+/// it is the one thing that breaks the store cache. Stores are cached PER
+/// THREAD (see `StoreCache` in `imp.rs`), so the process holds two
+/// `EKEventStore`s for every thread that has ever touched EventKit. The worker
+/// pool is fixed at roughly the core count, which keeps that total small; the
+/// blocking pool is not — tokio grows it to **512 threads** by default, which
+/// would mean up to 1024 stores. EventKit refuses long before that:
+///
+/// ```text
+/// EKCADErrorDomain 1021: "This process has too many EKEventStore instances.
+///                         Use fewer event stores."
+/// ```
+///
+/// That error is exactly the outage the per-thread cache was introduced to fix
+/// (a fresh store per tool call), and routing EventKit work onto the blocking
+/// pool would reintroduce it at a worse scale.
+///
+/// So: keep EventKit calls synchronous and on the handler's own thread. If a
+/// handler is slow enough to need backgrounding, use the MCP task surface
+/// (`execution(task_support = "optional")` + `enqueue_task`), which moves the
+/// work to another *worker* thread rather than an unbounded blocking one.
+#[derive(Clone)]
+pub struct EventKitServer {
+    /// Background tasks this server owns (SEP-1686).
+    ///
+    /// `Arc<Mutex<..>>` keeps `EventKitServer: Send + Sync + Clone`, which the
+    /// `!Send` invariant above depends on — the manager never holds an
+    /// EventKit object, only ids, statuses and join handles.
+    task_manager: std::sync::Arc<parking_lot::Mutex<TaskManager>>,
+}
 
 impl Default for EventKitServer {
     fn default() -> Self {
@@ -1239,7 +1296,9 @@ fn parse_datetime(s: &str) -> Result<DateTime<Local>, String> {
 #[allow(non_snake_case)]
 impl EventKitServer {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            task_manager: std::sync::Arc::new(parking_lot::Mutex::new(TaskManager::new())),
+        }
     }
 
     // ========================================================================
@@ -1247,7 +1306,12 @@ impl EventKitServer {
     // ========================================================================
 
     #[tool(
-        description = "Check macOS permission status for Reminders and Calendar without requesting access. Use this to diagnose authorization problems before calling other tools — it never triggers a consent dialog."
+        description = "Check macOS permission status for Reminders and Calendar without requesting access. Use this to diagnose authorization problems before calling other tools — it never triggers a consent dialog.",
+        annotations(
+            title = "Check Authorization Status",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn auth_status(&self) -> Result<Json<AuthStatusOutput>, McpError> {
         let reminders = RemindersManager::authorization_status();
@@ -1260,7 +1324,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Trigger the macOS consent dialog for Reminders or Calendar access. The first call shows the system prompt; subsequent calls return the cached status. Blocks until the user responds. Use `entity` = \"reminder\" or \"event\"."
+        description = "Trigger the macOS consent dialog for Reminders or Calendar access. The first call shows the system prompt; subsequent calls return the cached status. Blocks until the user responds. Use `entity` = \"reminder\" or \"event\".",
+        annotations(
+            title = "Request Access",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn request_access(
         &self,
@@ -1290,7 +1361,14 @@ impl EventKitServer {
     // Reminders Tools
     // ========================================================================
 
-    #[tool(description = "List all reminder lists (calendars) available in macOS Reminders.")]
+    #[tool(
+        description = "List all reminder lists (calendars) available in macOS Reminders.",
+        annotations(
+            title = "List Reminder Lists",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn list_reminder_lists(&self) -> Result<Json<ListResponse<CalendarOutput>>, McpError> {
         let manager = RemindersManager::new();
         match manager.list_calendars() {
@@ -1306,7 +1384,13 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "List reminders from macOS Reminders app. Filters: `show_completed` toggles inclusion of completed items; `list_name` restricts to one list; `due_after`/`due_before` window incomplete reminders by their due date; `completed_after`/`completed_before` window completed reminders by their completion date. When any `completed_*` filter is supplied, results are completed-only regardless of `show_completed`."
+        description = "List reminders from macOS Reminders app. Filters: `show_completed` toggles inclusion of completed items; `list_name` restricts to one list; `due_after`/`due_before` window incomplete reminders by their due date; `completed_after`/`completed_before` window completed reminders by their completion date. When any `completed_*` filter is supplied, results are completed-only regardless of `show_completed`.",
+        annotations(
+            title = "List Reminders",
+            read_only_hint = true,
+            open_world_hint = false
+        ),
+        execution(task_support = "optional")
     )]
     async fn list_reminders(
         &self,
@@ -1371,7 +1455,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Create a new reminder in macOS Reminders. You MUST specify which list to add it to (use list_reminder_lists first to see available lists). Inline configuration: alarms (time-based or proximity-based via `geofence`), recurrence, due/start dates, IANA timezone for the due date. NB: `URL`, free-text `location`, and `structured_location` are intentionally absent on the reminder surface — iCloud Reminders silently drops those mutations. Use `set_reminder_geofence` for location-based reminders (the iCloud-honored path); for events those fields are first-class via `create_event`. Tags (the Reminders.app Tag Sidebar) are an iCloud server-side feature not reachable through EventKit at all."
+        description = "Create a new reminder in macOS Reminders. You MUST specify which list to add it to (use list_reminder_lists first to see available lists). Inline configuration: alarms (time-based or proximity-based via `geofence`), recurrence, due/start dates, IANA timezone for the due date. NB: `URL`, free-text `location`, and `structured_location` are intentionally absent on the reminder surface — iCloud Reminders silently drops those mutations. Use `set_reminder_geofence` for location-based reminders (the iCloud-honored path); for events those fields are first-class via `create_event`. Tags (the Reminders.app Tag Sidebar) are an iCloud server-side feature not reachable through EventKit at all.",
+        annotations(
+            title = "Create Reminder",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn create_reminder(
         &self,
@@ -1457,7 +1548,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Update an existing reminder. All fields are optional; only the ones you supply are written. Inline edits: title, notes, completed, priority, due/start date (empty string clears), due-date IANA timezone (empty string clears), completion_date (empty string clears and marks incomplete), alarms (replaces all when supplied), recurrence, list move. NB: `URL`/`location`/`structured_location` are absent — see `create_reminder`."
+        description = "Update an existing reminder. All fields are optional; only the ones you supply are written. Inline edits: title, notes, completed, priority, due/start date (empty string clears), due-date IANA timezone (empty string clears), completion_date (empty string clears and marks incomplete), alarms (replaces all when supplied), recurrence, list move. NB: `URL`/`location`/`structured_location` are absent — see `create_reminder`.",
+        annotations(
+            title = "Update Reminder",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn update_reminder(
         &self,
@@ -1554,7 +1652,16 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Create a new reminder list (calendar for reminders).")]
+    #[tool(
+        description = "Create a new reminder list (calendar for reminders).",
+        annotations(
+            title = "Create Reminder List",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn create_reminder_list(
         &self,
         Parameters(params): Parameters<CreateReminderListRequest>,
@@ -1566,7 +1673,16 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Update a reminder list — change name and/or color.")]
+    #[tool(
+        description = "Update a reminder list — change name and/or color.",
+        annotations(
+            title = "Update Reminder List",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn update_reminder_list(
         &self,
         Parameters(params): Parameters<UpdateReminderListRequest>,
@@ -1580,7 +1696,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Delete a reminder list. WARNING: This will delete all reminders in the list!"
+        description = "Delete a reminder list. WARNING: This will delete all reminders in the list!",
+        annotations(
+            title = "Delete Reminder List",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn delete_reminder_list(
         &self,
@@ -1593,7 +1716,16 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Mark a reminder as completed.")]
+    #[tool(
+        description = "Mark a reminder as completed.",
+        annotations(
+            title = "Complete Reminder",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn complete_reminder(
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
@@ -1611,7 +1743,16 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Mark a reminder as not completed (uncomplete it).")]
+    #[tool(
+        description = "Mark a reminder as not completed (uncomplete it).",
+        annotations(
+            title = "Uncomplete Reminder",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn uncomplete_reminder(
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
@@ -1629,7 +1770,10 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Get a single reminder by its unique identifier.")]
+    #[tool(
+        description = "Get a single reminder by its unique identifier.",
+        annotations(title = "Get Reminder", read_only_hint = true, open_world_hint = false)
+    )]
     async fn get_reminder(
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
@@ -1641,7 +1785,16 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Delete a reminder from macOS Reminders.")]
+    #[tool(
+        description = "Delete a reminder from macOS Reminders.",
+        annotations(
+            title = "Delete Reminder",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn delete_reminder(
         &self,
         Parameters(params): Parameters<ReminderIdRequest>,
@@ -1667,17 +1820,21 @@ impl EventKitServer {
     // ------------------------------------------------------------------------
 
     #[tool(
-        description = "Set or clear the timezone applied specifically to the reminder's due date (separate from the item-level timezone). Use an IANA zone like \"America/Los_Angeles\". Pass `timezone: null` or `\"\"` to clear."
+        description = "Set or clear the timezone applied specifically to the reminder's due date (separate from the item-level timezone). Use an IANA zone like \"America/Los_Angeles\". Pass `timezone: null` or `\"\"` to clear.",
+        annotations(
+            title = "Set Reminder Due Timezone",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn set_reminder_due_timezone(
         &self,
         Parameters(params): Parameters<SetReminderDueTimezoneRequest>,
     ) -> Result<Json<ReminderOutput>, McpError> {
         let manager = RemindersManager::new();
-        let tz = params
-            .timezone
-            .as_deref()
-            .and_then(|t| if t.is_empty() { None } else { Some(t) });
+        let tz = params.timezone.as_deref().filter(|t| !t.is_empty());
         manager
             .set_due_date_timezone(&params.reminder_id, tz)
             .map_err(|e| mcp_err(&e))?;
@@ -1688,7 +1845,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Attach (or clear) a geofence on a reminder. Implemented as a location-based alarm — \"remind me when I arrive at/leave this place\". Triggers a Location permission prompt the first time. Omit `geofence` to clear any existing geofence."
+        description = "Attach (or clear) a geofence on a reminder. Implemented as a location-based alarm — \"remind me when I arrive at/leave this place\". Triggers a Location permission prompt the first time. Omit `geofence` to clear any existing geofence.",
+        annotations(
+            title = "Set Reminder Geofence",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn set_reminder_geofence(
         &self,
@@ -1724,7 +1888,14 @@ impl EventKitServer {
     // Calendar/Events Tools
     // ========================================================================
 
-    #[tool(description = "List all calendars available in macOS Calendar app.")]
+    #[tool(
+        description = "List all calendars available in macOS Calendar app.",
+        annotations(
+            title = "List Calendars",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn list_calendars(&self) -> Result<Json<ListResponse<CalendarOutput>>, McpError> {
         let manager = EventsManager::new();
         match manager.list_calendars() {
@@ -1740,7 +1911,12 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Return the calendar that will be used by `create_event` when no `calendar_name` is supplied. Mirrors `EKEventStore.defaultCalendarForNewEvents`."
+        description = "Return the calendar that will be used by `create_event` when no `calendar_name` is supplied. Mirrors `EKEventStore.defaultCalendarForNewEvents`.",
+        annotations(
+            title = "Get Default Event Calendar",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn get_default_event_calendar(&self) -> Result<Json<CalendarOutput>, McpError> {
         let manager = EventsManager::new();
@@ -1751,7 +1927,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Set an event's availability — controls how the event shows on the timeline. Use \"busy\" (default), \"free\", \"tentative\", or \"unavailable\". Always applies to just this occurrence (per-instance attribute)."
+        description = "Set an event's availability — controls how the event shows on the timeline. Use \"busy\" (default), \"free\", \"tentative\", or \"unavailable\". Always applies to just this occurrence (per-instance attribute).",
+        annotations(
+            title = "Set Event Availability",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn set_event_availability(
         &self,
@@ -1769,7 +1952,9 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "List calendar events. By default shows today's events. Can specify a date range."
+        description = "List calendar events. By default shows today's events. Can specify a date range.",
+        annotations(title = "List Events", read_only_hint = true, open_world_hint = false),
+        execution(task_support = "optional")
     )]
     async fn list_events(
         &self,
@@ -1809,7 +1994,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Create a new calendar event in macOS Calendar. Inline configuration: title, start/end (or duration), location, calendar, all-day flag, URL, alarms (time-based; events don't support proximity alarms), recurrence."
+        description = "Create a new calendar event in macOS Calendar. Inline configuration: title, start/end (or duration), location, calendar, all-day flag, URL, alarms (time-based; events don't support proximity alarms), recurrence.",
+        annotations(
+            title = "Create Event",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn create_event(
         &self,
@@ -1878,7 +2070,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Delete a calendar event. `span: \"this\" | \"future\"` controls recurring-event scope (default: \"this\"). The legacy boolean `affect_future` is still accepted as an alias for `span: \"future\"`."
+        description = "Delete a calendar event. `span: \"this\" | \"future\"` controls recurring-event scope (default: \"this\"). The legacy boolean `affect_future` is still accepted as an alias for `span: \"future\"`.",
+        annotations(
+            title = "Delete Event",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn delete_event(
         &self,
@@ -1895,7 +2094,10 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Get a single calendar event by its unique identifier.")]
+    #[tool(
+        description = "Get a single calendar event by its unique identifier.",
+        annotations(title = "Get Event", read_only_hint = true, open_world_hint = false)
+    )]
     async fn get_event(
         &self,
         Parameters(params): Parameters<EventIdRequest>,
@@ -1911,7 +2113,16 @@ impl EventKitServer {
     // Event Calendar Management
     // ========================================================================
 
-    #[tool(description = "Create a new calendar for events.")]
+    #[tool(
+        description = "Create a new calendar for events.",
+        annotations(
+            title = "Create Event Calendar",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn create_event_calendar(
         &self,
         Parameters(params): Parameters<CreateReminderListRequest>,
@@ -1923,7 +2134,16 @@ impl EventKitServer {
         }
     }
 
-    #[tool(description = "Update an event calendar — change name and/or color.")]
+    #[tool(
+        description = "Update an event calendar — change name and/or color.",
+        annotations(
+            title = "Update Event Calendar",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn update_event_calendar(
         &self,
         Parameters(params): Parameters<UpdateEventCalendarRequest>,
@@ -1940,7 +2160,14 @@ impl EventKitServer {
     }
 
     #[tool(
-        description = "Delete an event calendar. WARNING: This will delete all events in the calendar!"
+        description = "Delete an event calendar. WARNING: This will delete all events in the calendar!",
+        annotations(
+            title = "Delete Event Calendar",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn delete_event_calendar(
         &self,
@@ -1957,7 +2184,14 @@ impl EventKitServer {
     // Sources
     // ========================================================================
 
-    #[tool(description = "List all available sources (accounts like iCloud, Local, Exchange).")]
+    #[tool(
+        description = "List all available sources (accounts like iCloud, Local, Exchange).",
+        annotations(
+            title = "List Accounts",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn list_sources(&self) -> Result<Json<ListResponse<SourceOutput>>, McpError> {
         let manager = RemindersManager::new();
         match manager.list_sources() {
@@ -1977,7 +2211,14 @@ impl EventKitServer {
     // ========================================================================
 
     #[tool(
-        description = "Update an existing calendar event. All fields are optional; only those you supply are written. Inline edits: title, notes (empty clears), location (empty clears), start/end, all_day toggle, calendar move (`calendar_name`), URL (empty clears), availability, structured_location (null clears), alarms (replaces all), recurrence (empty frequency clears). `span: \"this\" | \"future\"` controls recurring-event edit scope; defaults to \"this\"."
+        description = "Update an existing calendar event. All fields are optional; only those you supply are written. Inline edits: title, notes (empty clears), location (empty clears), start/end, all_day toggle, calendar move (`calendar_name`), URL (empty clears), availability, structured_location (null clears), alarms (replaces all), recurrence (empty frequency clears). `span: \"this\" | \"future\"` controls recurring-event edit scope; defaults to \"this\".",
+        annotations(
+            title = "Update Event",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn update_event(
         &self,
@@ -2064,7 +2305,12 @@ impl EventKitServer {
 
     #[cfg(feature = "location")]
     #[tool(
-        description = "Get the user's current location (latitude, longitude). Requires location permission."
+        description = "Get the user's current location (latitude, longitude). Requires location permission.",
+        annotations(
+            title = "Get Current Location",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn get_current_location(&self) -> Result<Json<CoordinateOutput>, McpError> {
         let manager = crate::location::LocationManager::new();
@@ -2081,7 +2327,9 @@ impl EventKitServer {
     // ========================================================================
 
     #[tool(
-        description = "Search reminders or events by text in title or notes (case-insensitive). Specify item_type to filter, or omit to search both."
+        description = "Search reminders or events by text in title or notes (case-insensitive). Specify item_type to filter, or omit to search both.",
+        annotations(title = "Search", read_only_hint = true, open_world_hint = false),
+        execution(task_support = "optional")
     )]
     async fn search(
         &self,
@@ -2154,7 +2402,17 @@ impl EventKitServer {
     // Batch Operations
     // ========================================================================
 
-    #[tool(description = "Delete multiple reminders or events at once.")]
+    #[tool(
+        description = "Delete multiple reminders or events at once.",
+        annotations(
+            title = "Batch Delete",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        execution(task_support = "optional")
+    )]
     async fn batch_delete(
         &self,
         Parameters(params): Parameters<BatchDeleteRequest>,
@@ -2201,7 +2459,17 @@ impl EventKitServer {
         }))
     }
 
-    #[tool(description = "Move multiple reminders to a different list at once.")]
+    #[tool(
+        description = "Move multiple reminders to a different list at once.",
+        annotations(
+            title = "Batch Move Reminders",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        execution(task_support = "optional")
+    )]
     async fn batch_move(
         &self,
         Parameters(params): Parameters<BatchMoveRequest>,
@@ -2241,7 +2509,17 @@ impl EventKitServer {
         }))
     }
 
-    #[tool(description = "Update multiple reminders or events at once.")]
+    #[tool(
+        description = "Update multiple reminders or events at once.",
+        annotations(
+            title = "Batch Update",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        execution(task_support = "optional")
+    )]
     async fn batch_update(
         &self,
         Parameters(params): Parameters<BatchUpdateRequest>,
@@ -2524,7 +2802,7 @@ impl EventKitServer {
         }
 
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!(
                 "Here are the current incomplete reminders:\n\n{output}\n\nPlease help me manage these reminders."
             ),
@@ -2553,7 +2831,7 @@ impl EventKitServer {
         }
 
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             format!(
                 "Here are the available reminder lists:\n\n{output}\n\nWhich list would you like to work with?"
             ),
@@ -2593,7 +2871,7 @@ impl EventKitServer {
                     },
                 ) {
                     Ok(updated) => Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                        PromptMessageRole::User,
+                        Role::User,
                         format!(
                             "Moved reminder \"{}\" to list \"{}\".",
                             updated.title, dest_list.title
@@ -2601,7 +2879,7 @@ impl EventKitServer {
                     )])
                     .with_description("Reminder moved")),
                     Err(e) => Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                        PromptMessageRole::User,
+                        Role::User,
                         format!("Failed to move reminder: {e}"),
                     )])
                     .with_description("Move failed")),
@@ -2610,7 +2888,7 @@ impl EventKitServer {
             None => {
                 let available: Vec<&str> = lists.iter().map(|l| l.title.as_str()).collect();
                 Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                    PromptMessageRole::User,
+                    Role::User,
                     format!(
                         "Could not find reminder list \"{}\". Available lists: {}",
                         args.destination_list,
@@ -2663,14 +2941,13 @@ impl EventKitServer {
                     details.push_str(&format!("\nList: {list}"));
                 }
 
-                Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                    PromptMessageRole::User,
-                    details,
-                )])
-                .with_description("Reminder created"))
+                Ok(
+                    GetPromptResult::new(vec![PromptMessage::new_text(Role::User, details)])
+                        .with_description("Reminder created"),
+                )
             }
             Err(e) => Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 format!("Failed to create reminder: {e}"),
             )])
             .with_description("Creation failed")),
@@ -2682,14 +2959,169 @@ impl EventKitServer {
 #[tool_handler]
 #[prompt_handler]
 impl rmcp::ServerHandler for EventKitServer {
+    // ── MCP tasks (SEP-1686) ────────────────────────────────────────────
+    //
+    // Some EventKit work is slow enough that a host may time the call out: a
+    // full-calendar scan, or a `batch_*` over hundreds of items. Tools that
+    // declare `execution(task_support = "optional")` can be invoked
+    // task-augmented — this returns a task id immediately and runs the work in
+    // the background.
+    //
+    // Unlike most MCP task servers, this one PUSHES: every status transition
+    // sends `notifications/tasks/status` to the caller, so a task-aware client
+    // never has to poll to discover the work finished.
+
+    async fn enqueue_task(
+        &self,
+        request: CallToolRequestParams,
+        mut context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CreateTaskResult, McpError> {
+        // Hold the manager lock across BOTH admission and insertion, below.
+        // The worker's only interactions with the manager — its own transition
+        // and its failure guard's — take this same lock, so neither can run
+        // before the task is registered. Without that ordering, a worker that
+        // panicked in the window between `spawn` and `insert` would transition
+        // a task that did not exist yet, and the entry inserted a moment later
+        // would sit in `Working` forever. Holding one lock also closes the gap
+        // where two concurrent enqueues both passed `admit`.
+        let mut tasks = self.task_manager.lock();
+        tasks.admit()?;
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let now = tasks::now_iso8601();
+        let task = Task::new(task_id.clone(), TaskStatus::Working, now.clone(), now)
+            .with_poll_interval(1000);
+
+        let completion = std::sync::Arc::new(TaskCompletion::new());
+        let worker_completion = std::sync::Arc::clone(&completion);
+
+        // A child token so `tasks/cancel` can stop the work WITHOUT severing
+        // the transport cancellation this request already inherited.
+        let task_cancel = context.ct.child_token();
+        context.ct = task_cancel.clone();
+
+        let server = self.clone();
+        let peer = context.peer.clone();
+        let manager = std::sync::Arc::clone(&self.task_manager);
+        let worker_id = task_id.clone();
+
+        let guard = TaskFailureGuard::new(
+            worker_id.clone(),
+            std::sync::Arc::clone(&completion),
+            std::sync::Arc::clone(&manager),
+        );
+
+        let handle = tokio::spawn(async move {
+            // Armed until this worker reports for itself. `call_tool` can panic
+            // — objc2's non-null accessors abort on NULL, and several
+            // conversions unwrap on user data — and nothing here catches an
+            // unwind, so without the guard the task would never leave `Working`
+            // and its active slot would never be reclaimed.
+            let guard = guard;
+
+            let result = server.call_tool(request, context).await;
+            let failed = result.as_ref().map_or(true, |r| r.is_error == Some(true));
+            worker_completion.complete(result);
+
+            // Record the transition and push it. `transition` returns Some only
+            // on a REAL change, so a task cancelled a moment ago (already
+            // terminal) produces no second notification here.
+            let terminal = if failed {
+                TaskStatus::Failed
+            } else {
+                TaskStatus::Completed
+            };
+            let changed = manager.lock().transition(&worker_id, terminal);
+            guard.disarm();
+            if let Some(task) = changed {
+                let notification = ServerNotification::TaskStatusNotification(
+                    TaskStatusNotification::new(TaskStatusNotificationParam::new(task)),
+                );
+                // Fire-and-forget: a dead client must not be an error path.
+                if let Err(e) = peer.send_notification(notification).await {
+                    tracing::debug!(
+                        target: "eventkit",
+                        task = %worker_id,
+                        "tasks/status push failed — client gone: {e}"
+                    );
+                }
+            }
+        });
+
+        tasks.insert(
+            task_id,
+            ManagedTask::running(task.clone(), completion, task_cancel, handle),
+        );
+        drop(tasks);
+
+        Ok(CreateTaskResult::new(task))
+    }
+
+    async fn list_tasks(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListTasksResult, McpError> {
+        Ok(ListTasksResult::new(self.task_manager.lock().list_page()))
+    }
+
+    async fn get_task_info(
+        &self,
+        request: GetTaskParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        let task = self.task_manager.lock().task_info(&request.task_id)?;
+        Ok(GetTaskResult::new(task))
+    }
+
+    async fn get_task_result(
+        &self,
+        request: GetTaskPayloadParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<GetTaskPayloadResult, McpError> {
+        // Take the Arc, then DROP the manager lock before awaiting — holding a
+        // sync mutex across an await would block every other task operation for
+        // as long as this one waits.
+        let completion = self.task_manager.lock().completion(&request.task_id)?;
+        let result = completion.wait(&context.ct).await?;
+        let value = serde_json::to_value(result)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(GetTaskPayloadResult::new(value))
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CancelTaskResult, McpError> {
+        // The lock is released at the end of this statement, BEFORE the abort
+        // below — see `TaskManager::cancel_task` for why that ordering matters.
+        let (task, aborted) = self.task_manager.lock().cancel_task(&request.task_id)?;
+        if let Some(handle) = aborted {
+            handle.abort();
+        }
+        // Push the cancellation too — a client awaiting this task should learn
+        // from the notification stream, not only from the reply to its own call.
+        let notification = ServerNotification::TaskStatusNotification(TaskStatusNotification::new(
+            TaskStatusNotificationParam::new(task.clone()),
+        ));
+        let _ = context.peer.send_notification(notification).await;
+        Ok(CancelTaskResult::new(task))
+    }
+
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_prompts()
-                .build(),
-        )
-        .with_instructions(
+        let mut capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_prompts()
+            .enable_tasks()
+            .build();
+        // `enable_tasks()` only flips the capability on. The protocol also wants
+        // the supported lifecycle methods and which requests may be
+        // task-augmented; `server_default()` is exactly
+        // `requests.tools.call` + `list` + `cancel`, which is what this server
+        // implements.
+        capabilities.tasks = Some(TasksCapability::server_default());
+        ServerInfo::new(capabilities).with_instructions(
             "This MCP server provides access to macOS Calendar events and Reminders. \
              Use the available tools to list, create, update, and delete calendar events \
              and reminders. Authorization is handled automatically on first use.",
@@ -2699,7 +3131,7 @@ impl rmcp::ServerHandler for EventKitServer {
 
 /// Serve the EventKit MCP server on any async read/write transport.
 ///
-/// Used by the in-process gateway (via `DuplexStream`) and for testing.
+/// Used by the in-process bridge (via `DuplexStream`) and for testing.
 /// The standalone binary uses [`run_mcp_server`] which wraps this with stdio.
 pub async fn serve_on<T>(transport: T) -> anyhow::Result<()>
 where
@@ -2756,6 +3188,16 @@ pub fn dump_reminder_raw(id: &str, read_values: bool) -> Result<String, crate::E
 pub fn dump_reminder_private(id: &str) -> Result<String, crate::EventKitError> {
     let manager = RemindersManager::new();
     manager.dump_reminder_private(id)
+}
+
+/// Probe suspected-private selectors on an EVENT. Read-only, exception-safe.
+///
+/// Same probe list as `dump_reminder_private`, so a rich-notes finding on
+/// either EKReminder or EKEvent shows up in both reports. `notes` is included
+/// as a baseline — compare its reported CLASS against any attributed-notes hit.
+pub fn dump_event_private(id: &str) -> Result<String, crate::EventKitError> {
+    let manager = EventsManager::new();
+    manager.dump_event_private(id)
 }
 
 /// Dump all reminders as pretty JSON (summary mode — no alarm/recurrence fetch).
@@ -2905,21 +3347,45 @@ mod tests {
         }
     }
 
+    /// Only FULL access on BOTH entities means "nothing to fix".
     #[test]
-    fn auth_remediation_absent_when_both_granted() {
-        for r in [
-            AuthorizationStatus::FullAccess,
-            AuthorizationStatus::WriteOnly,
-        ] {
-            for e in [
+    fn auth_remediation_absent_only_when_both_have_full_access() {
+        assert!(
+            auth_remediation(
+                AuthorizationStatus::FullAccess,
+                AuthorizationStatus::FullAccess
+            )
+            .is_none(),
+            "full access on both needs no remediation"
+        );
+    }
+
+    /// Regression guard for the `auth_status` half of the write-only defect:
+    /// a write-only grant MUST still produce a remediation hint. Treating it
+    /// as granted told the user everything was fine while every read came
+    /// back silently empty.
+    #[test]
+    fn auth_remediation_present_for_write_only() {
+        for (r, e) in [
+            (
+                AuthorizationStatus::WriteOnly,
+                AuthorizationStatus::WriteOnly,
+            ),
+            (
+                AuthorizationStatus::WriteOnly,
+                AuthorizationStatus::FullAccess,
+            ),
+            (
                 AuthorizationStatus::FullAccess,
                 AuthorizationStatus::WriteOnly,
-            ] {
-                assert!(
-                    auth_remediation(r, e).is_none(),
-                    "expected no remediation for ({r:?}, {e:?})"
-                );
-            }
+            ),
+        ] {
+            let hint = auth_remediation(r, e)
+                .unwrap_or_else(|| panic!("write-only must produce a hint for ({r:?}, {e:?})"));
+            assert!(
+                hint.to_lowercase().contains("full"),
+                "the hint must name FULL access, got: {hint}"
+            );
         }
     }
 

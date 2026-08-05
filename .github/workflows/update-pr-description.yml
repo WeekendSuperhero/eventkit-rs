@@ -1,0 +1,28 @@
+name: Update PR Description
+
+on:
+  pull_request:
+    # synchronize = new commits pushed, so a PR opted in via the trigger phrase
+    # keeps its description current as commits land (the reusable workflow no-ops
+    # when the phrase is absent).
+    types: [opened, edited, synchronize]
+
+jobs:
+  update-pr:
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: weekendsuperhero-io/platform-tools/.github/workflows/reusable-pr-description.yml@72bbd124823a11bc4cd1d517af08b608346b09cc
+    with:
+      trigger-phrase: "@AgentMuse pr-title"
+      # Send full commit message bodies (not just `--oneline` subjects) so
+      # the LLM has access to multi-paragraph commit rationale when composing
+      # the PR description. See platform-tools commit 1aeab33.
+      commit-format: full
+      # Warp runner + Linear-aware `## Linear` section (IDs extracted from
+      # branch/commits/body; verbs like Closes/Part of drive Linear's
+      # close-on-merge; LINEAR_API_KEY secret enriches with issue titles).
+      # Requires platform-tools PR #1 (the input exists there) — merge that
+      # first.
+      runs-on: ubuntu-latest
+    secrets: inherit

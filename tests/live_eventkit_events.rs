@@ -376,3 +376,47 @@ fn live_eventkit_refresh_after_save_visible_across_managers() {
         .expect("fresh manager should see the just-saved event");
     assert_eq!(observed.title, "Live: refresh-after-save");
 }
+
+/// `dump_event_private` must survive a real `EKEvent`.
+///
+/// It lives here rather than in the unit tests because it needs Full Access and
+/// a real event id — there is nothing to call it on without a live store.
+///
+/// The value is not the output, which is a diagnostic dump whose exact contents
+/// are expected to drift with the OS. It is that the reflection walk does not
+/// ABORT: the probe messages a long list of undocumented selectors, and a
+/// selector that returns NULL through an `objc2` binding declared non-null
+/// takes the whole thread down. That is not theoretical here — an
+/// `eventStoreIdentifier()` call on the construction path did exactly that (see
+/// `AUTHORIZATION_PLAN.md`), and this method pokes far more obscure corners than
+/// that one did. Reaching the assertions at all is the result under test.
+#[test]
+#[ignore]
+fn live_eventkit_dump_event_private_survives_a_real_event() {
+    let g = TestCalendarGuard::new();
+    let mgr = g.manager();
+    let created = mgr
+        .create_event(&EventDraft {
+            notes: Some("baseline notes for the private-selector probe"),
+            ..base_draft("Live: dump-event-private")
+        })
+        .expect("create_event failed");
+
+    let dump = mgr
+        .dump_event_private(&created.identifier)
+        .expect("dump_event_private must not error on a real event");
+
+    assert!(!dump.is_empty(), "the probe must report something");
+    assert!(
+        dump.contains("notes"),
+        "`notes` is the documented BASELINE the probe compares against, so it \
+         must always appear; got: {dump}"
+    );
+
+    // An unknown identifier must be a clean error, not a panic.
+    assert!(
+        mgr.dump_event_private("definitely-not-an-event-id")
+            .is_err(),
+        "an unknown event id must return an error"
+    );
+}

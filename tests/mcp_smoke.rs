@@ -13,7 +13,8 @@
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 /// Path to the binary cargo built for the integration test.
@@ -25,7 +26,8 @@ fn bin_path() -> std::path::PathBuf {
 struct McpClient {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Lines pumped off the child's stdout by a reader thread. See `spawn`.
+    lines: Receiver<String>,
     next_id: i64,
 }
 
@@ -39,13 +41,39 @@ impl McpClient {
             .spawn()
             .expect("failed to spawn eventkit --mcp");
         let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let stdout = child.stdout.take().unwrap();
+
+        // Read on a separate thread and hand lines over a channel.
+        //
+        // `BufRead::read_line` cannot honour a deadline: it blocks until a line
+        // arrives, so a timeout checked around it only fires if the server is
+        // still TALKING. When the server goes SILENT — a wedged worker thread,
+        // a task that panicked and never reported — the read never returns and
+        // the deadline is never reached. That turned a 10s assertion into an
+        // opaque 60s harness kill with no message. `recv_timeout` on this side
+        // makes every timeout in this file real.
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { return };
+                if tx.send(line).is_err() {
+                    return; // client dropped
+                }
+            }
+        });
+
         Self {
             child,
             stdin,
-            stdout,
+            lines,
             next_id: 0,
         }
+    }
+
+    /// Next line from the server, or `None` once `deadline` passes.
+    fn next_line(&self, deadline: Instant) -> Option<String> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        self.lines.recv_timeout(remaining).ok()
     }
 
     fn send(&mut self, msg: &Value) {
@@ -58,14 +86,12 @@ impl McpClient {
     fn recv_response(&mut self, id: i64, timeout: Duration) -> Value {
         let deadline = Instant::now() + timeout;
         loop {
-            if Instant::now() >= deadline {
-                panic!("timed out waiting for response id={id}");
-            }
-            let mut line = String::new();
-            let n = self.stdout.read_line(&mut line).expect("read MCP stdout");
-            if n == 0 {
-                panic!("MCP server closed stdout before response id={id}");
-            }
+            let Some(line) = self.next_line(deadline) else {
+                panic!(
+                    "timed out after {timeout:?} waiting for response id={id} — \
+                     the server went silent or closed stdout"
+                );
+            };
             let v: Value = serde_json::from_str(line.trim())
                 .unwrap_or_else(|e| panic!("non-JSON line from MCP server: {line:?} ({e})"));
             if v.get("id").and_then(Value::as_i64) == Some(id) {
@@ -90,6 +116,29 @@ impl McpClient {
         let resp = self.recv_response(id, Duration::from_secs(5));
         assert!(resp.get("result").is_some(), "initialize returned: {resp}");
         self.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    }
+
+    /// Send an arbitrary JSON-RPC request and return the response.
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        self.recv_response(id, Duration::from_secs(10))
+    }
+
+    /// Read lines until a NOTIFICATION with `method` arrives, or timeout.
+    /// Responses seen along the way are discarded.
+    fn wait_for_notification(&mut self, method: &str, timeout: Duration) -> Option<Value> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let line = self.next_line(deadline)?;
+            let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            if v.get("id").is_none() && v.get("method").and_then(Value::as_str) == Some(method) {
+                return Some(v);
+            }
+        }
     }
 
     fn list_tools(&mut self) -> Vec<Value> {
@@ -149,6 +198,17 @@ fn mcp_auth_status_tool_is_registered() {
         names.contains(&"auth_status"),
         "auth_status not in tools/list. Got: {names:?}"
     );
+}
+
+/// Whether the SPAWNED SERVER has full Reminders access, asked over the
+/// protocol via `auth_status` (read-only, never fires a TCC dialog).
+///
+/// Reading `RemindersManager::authorization_status()` from the test process
+/// would answer the wrong question: TCC grants attach to a binary's identity,
+/// and the test binary is not the `eventkit` binary under test.
+fn server_has_full_access(c: &mut McpClient) -> bool {
+    let resp = c.call_tool("auth_status", json!({}));
+    resp["result"]["structuredContent"]["reminders"] == "FullAccess"
 }
 
 #[test]
@@ -260,4 +320,214 @@ fn mcp_handles_multiple_sequential_requests_without_panic() {
     let _ = c.call_tool("auth_status", json!({}));
     let _ = c.list_tools();
     let _ = c.call_tool("auth_status", json!({}));
+}
+
+/// EVERY tool must carry annotations, and the safety hints must be coherent.
+///
+/// The host groups a backend's tools by annotation
+/// (`BackendNutritionCard.tsx::groupToolsByAnnotation`): `readOnlyHint` →
+/// "Read-Only", `destructiveHint` → "Destructive", neither → "Safe Write",
+/// and **no annotations at all → "Other"**. Before this, all 32 EventKit tools
+/// had none, so the entire server collapsed into one undifferentiated "Other"
+/// bucket and the user got no read-vs-destroy signal anywhere in the UI.
+///
+/// This fails if a new tool ships unannotated, which would silently put it
+/// back in "Other".
+#[test]
+fn mcp_every_tool_is_annotated_and_coherent() {
+    let mut c = McpClient::spawn();
+    c.initialize();
+    let tools = c.list_tools();
+    assert!(!tools.is_empty(), "tools/list must not be empty");
+
+    let mut unannotated = Vec::new();
+    let mut incoherent = Vec::new();
+    let (mut read_only, mut destructive, mut safe_write) = (0, 0, 0);
+
+    for t in &tools {
+        let name = t["name"].as_str().unwrap_or("<unnamed>").to_string();
+        let Some(ann) = t.get("annotations").filter(|a| a.is_object()) else {
+            unannotated.push(name);
+            continue;
+        };
+        let ro = ann["readOnlyHint"].as_bool().unwrap_or(false);
+        let de = ann["destructiveHint"].as_bool().unwrap_or(false);
+
+        // A read-only tool cannot also be destructive — that is a contradiction,
+        // and the grouping would silently prefer "Read-Only" and hide the risk.
+        if ro && de {
+            incoherent.push(name.clone());
+        }
+        // Every tool should carry a human title for the UI.
+        if ann["title"].as_str().unwrap_or("").is_empty() {
+            incoherent.push(format!("{name} (no title)"));
+        }
+
+        if ro {
+            read_only += 1;
+        } else if de {
+            destructive += 1;
+        } else {
+            safe_write += 1;
+        }
+    }
+
+    assert!(
+        unannotated.is_empty(),
+        "these tools have NO annotations and would fall into the host's \"Other\" \
+         bucket: {unannotated:?}"
+    );
+    assert!(
+        incoherent.is_empty(),
+        "incoherent or untitled annotations: {incoherent:?}"
+    );
+
+    // Sanity: this server genuinely spans all three groups. If a whole class
+    // vanished, the classification was probably flattened by accident.
+    assert!(read_only > 0, "expected some read-only tools");
+    assert!(destructive > 0, "expected some destructive tools (deletes)");
+    assert!(
+        safe_write > 0,
+        "expected some safe-write tools (creates/updates)"
+    );
+}
+
+/// The server must ADVERTISE tasks with the shape it actually implements.
+///
+/// `enable_tasks()` alone serializes an empty `tasks: {}`, which under-declares
+/// the surface — a client can't tell whether `tasks/list` or `tasks/cancel`
+/// exist. `TasksCapability::server_default()` declares
+/// `requests.tools.call` + `list` + `cancel`, which is exactly what this
+/// server implements.
+#[test]
+fn mcp_advertises_the_task_capability_it_implements() {
+    let mut c = McpClient::spawn();
+    c.next_id += 1;
+    let id = c.next_id;
+    c.send(&json!({
+        "jsonrpc": "2.0", "id": id, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "eventkit-mcp-smoke", "version": "0"},
+        },
+    }));
+    let resp = c.recv_response(id, Duration::from_secs(5));
+    let tasks = &resp["result"]["capabilities"]["tasks"];
+    assert!(
+        tasks.is_object(),
+        "tasks capability must be advertised: {resp}"
+    );
+    assert!(
+        tasks["requests"]["tools"]["call"].is_object(),
+        "task-augmented tools/call must be declared: {tasks}"
+    );
+    assert!(
+        tasks["list"].is_object(),
+        "tasks/list must be declared: {tasks}"
+    );
+    assert!(
+        tasks["cancel"].is_object(),
+        "tasks/cancel must be declared: {tasks}"
+    );
+}
+
+/// Slow tools must declare `execution.taskSupport`, or a host has no way to
+/// know it may run them task-augmented and will keep timing them out.
+#[test]
+fn mcp_slow_tools_declare_task_support() {
+    let mut c = McpClient::spawn();
+    c.initialize();
+    let tools = c.list_tools();
+    let capable: Vec<&str> = tools
+        .iter()
+        .filter(|t| !t["execution"]["taskSupport"].is_null())
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    for expected in ["search", "batch_delete", "batch_move", "batch_update"] {
+        assert!(
+            capable.contains(&expected),
+            "`{expected}` is slow enough to need taskSupport; declared: {capable:?}"
+        );
+    }
+}
+
+/// End-to-end: a task-augmented call returns a task id, the task reaches a
+/// terminal state, `tasks/result` yields the payload — and the server PUSHES
+/// `notifications/tasks/status` rather than making the client poll.
+///
+/// The push is the part worth guarding. A task server that only answers polls
+/// is half a task server, and the notification is invisible to any test that
+/// just calls `tasks/get` in a loop.
+#[test]
+fn mcp_task_roundtrip_emits_status_notification() {
+    let mut c = McpClient::spawn();
+    c.initialize();
+
+    // Skip unless the SERVER has full access.
+    //
+    // This used to claim it worked on an unauthorized host too — "the tool
+    // fails inside the worker, the task goes to failed, and the push still
+    // fires". That was wrong, and it is what wedged CI: with the status
+    // `NotDetermined`, `search` does not fail, it calls `request_access` and
+    // parks the worker on the TCC consent dialog. A headless runner can never
+    // dismiss that dialog, so the worker never reported, no status was ever
+    // pushed, and the test sat until the harness killed it.
+    //
+    // The authorization state must be read from the SERVER, not from this test
+    // process: TCC identity is per-binary, so the test binary's own grant says
+    // nothing about the spawned `eventkit --mcp`.
+    if !server_has_full_access(&mut c) {
+        eprintln!("SKIP: the eventkit server lacks Full Access on this host");
+        return;
+    }
+
+    // MUST be a tool that DECLARES taskSupport — rmcp rejects task-augmenting
+    // one that doesn't ("Tool does not support task-based invocation"), which
+    // is the correct advertised==invokable behaviour. `search` is declared.
+    let created = c.request(
+        "tools/call",
+        json!({
+            "name": "search",
+            "arguments": {"query": "eventkit-task-smoke-probe"},
+            "task": {}
+        }),
+    );
+    let task_id = created["result"]["task"]["taskId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a created task: {created}"))
+        .to_string();
+    assert_eq!(
+        created["result"]["task"]["status"], "working",
+        "a fresh task starts working: {created}"
+    );
+
+    // THE ASSERTION THAT MATTERS: the terminal transition arrives unprompted.
+    let note = c
+        .wait_for_notification("notifications/tasks/status", Duration::from_secs(10))
+        .expect("server must PUSH tasks/status on the terminal transition, not force a poll");
+    assert_eq!(note["params"]["taskId"], task_id.as_str());
+    let pushed = note["params"]["status"].as_str().unwrap_or("");
+    assert!(
+        matches!(pushed, "completed" | "failed"),
+        "pushed status must be terminal, got {pushed:?}"
+    );
+
+    // And the result is retrievable afterwards.
+    let payload = c.request("tasks/result", json!({"taskId": task_id}));
+    assert!(
+        payload.get("result").is_some(),
+        "tasks/result must yield the payload: {payload}"
+    );
+
+    // tasks/list must include it.
+    let listed = c.request("tasks/list", json!({}));
+    let ids: Vec<&str> = listed["result"]["tasks"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|t| t["taskId"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        ids.contains(&task_id.as_str()),
+        "tasks/list must include it: {listed}"
+    );
 }
