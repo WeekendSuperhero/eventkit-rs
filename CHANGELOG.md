@@ -35,7 +35,7 @@ folded in here rather than reconstructed after the fact.
 - **MCP task surface (SEP-1686)** — slow tools (full-calendar scans, batch operations) can be invoked task-augmented, returning a task id immediately. Bounded memory (16 concurrent, 256 tracked, 1h TTL), real cancellation, and a pushed `notifications/tasks/status` on every transition so clients need not poll.
 - **MCP Server** — `auth_status` and `request_access` tools, tools to set due timezone, geofence, and event availability, and an embedded `Info.plist` to trigger macOS TCC privacy prompts.
 - **EventKit Core** — exposed `URL`, `availability`, `structured_location`, `due_date_timezone`, and `attachments_count`, plus raw reflection via `dump_reminder_raw` / `dump_reminder_private`.
-- **Testing** — live EventKit tests (including store-cache checks against external writes) and MCP smoke tests.
+- **Testing** — live EventKit tests (including store-cache checks against external writes) and MCP smoke tests. The memory- and liveness-critical paths are covered directly rather than incidentally: completion-block timeouts, task TTL pruning and oldest-terminal eviction, panic containment, and a single-store-construction-site assertion.
 - **PR description workflow** — GitHub Actions workflow to update PR descriptions on open and edit.
 
 ### Changed

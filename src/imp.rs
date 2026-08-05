@@ -4089,6 +4089,81 @@ mod tests {
         );
     }
 
+    // ── Completion-block timeouts ────────────────────────────────────────
+    //
+    // `wait_for_completion` is the guard against a permanent worker-thread
+    // wedge: every EventKit call in this file parks a thread until an Obj-C
+    // block fires, and a block that never fires used to park it forever. The
+    // helper takes a plain `Condvar`, so the timeout is testable with no
+    // EventKit and no TCC state — which matters, because the failure it exists
+    // to prevent only reproduces on a host that can't answer a consent dialog.
+
+    /// A completion that NEVER fires must give up, not park forever.
+    #[test]
+    fn wait_for_completion_gives_up_when_nothing_arrives() {
+        let lock = Mutex::new(None::<u8>);
+        let cvar = Condvar::new();
+        let mut guard = lock.lock();
+
+        let start = std::time::Instant::now();
+        let arrived = wait_for_completion(&cvar, &mut guard, std::time::Duration::from_millis(150));
+        let waited = start.elapsed();
+
+        assert!(!arrived, "must report timeout, not a phantom completion");
+        assert!(guard.is_none(), "the slot must be left untouched");
+        assert!(
+            waited >= std::time::Duration::from_millis(150),
+            "must actually wait the full budget, waited {waited:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "must not park past the budget, waited {waited:?}"
+        );
+    }
+
+    /// The happy path still works: a block that fires wakes the waiter and its
+    /// value is delivered. Without this, a timeout that always returned false
+    /// would pass the test above.
+    #[test]
+    fn wait_for_completion_returns_the_value_a_block_publishes() {
+        let pair = Arc::new((Mutex::new(None::<u8>), Condvar::new()));
+        let writer = Arc::clone(&pair);
+
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let (lock, cvar) = &*writer;
+            *lock.lock() = Some(7);
+            cvar.notify_one();
+        });
+
+        let (lock, cvar) = &*pair;
+        let mut guard = lock.lock();
+        let arrived = wait_for_completion(cvar, &mut guard, std::time::Duration::from_secs(5));
+
+        assert!(arrived, "a completion that fires must be observed");
+        assert_eq!(guard.take(), Some(7));
+    }
+
+    /// A value already in the slot must return immediately — the loop condition
+    /// is checked before waiting, so this must not depend on a notification
+    /// that already came and went.
+    #[test]
+    fn wait_for_completion_does_not_wait_on_an_already_full_slot() {
+        let lock = Mutex::new(Some(1u8));
+        let cvar = Condvar::new();
+        let mut guard = lock.lock();
+
+        let start = std::time::Instant::now();
+        // A long budget: if this consulted the condvar it would hang here.
+        let arrived = wait_for_completion(&cvar, &mut guard, std::time::Duration::from_secs(30));
+
+        assert!(arrived);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "must return immediately when the slot is already full"
+        );
+    }
+
     /// EXACTLY ONE place in this file may construct a store.
     ///
     /// This guards the outage that shipped before the cache existed: both

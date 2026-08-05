@@ -394,6 +394,133 @@ mod tests {
         )
     }
 
+    /// Backdate a terminal task's TTL clock so pruning can be tested without
+    /// waiting out `TASK_TTL_MS` (an hour).
+    ///
+    /// Reaches into the private field deliberately: the alternative is a
+    /// production-visible clock parameter that exists only for tests. The task
+    /// is made terminal through the REAL path (`transition`) first, so only the
+    /// passage of time is faked.
+    fn backdate_terminal(mgr: &mut TaskManager, task_id: &str, age_ms: u64) {
+        let entry = mgr
+            .find_mut(task_id)
+            .unwrap_or_else(|| panic!("{task_id} must exist"));
+        assert!(
+            entry.terminal_at_ms.is_some(),
+            "{task_id} must already be terminal before backdating"
+        );
+        entry.terminal_at_ms = Some(now_millis().saturating_sub(age_ms));
+    }
+
+    // ── Memory bounds: TTL pruning and eviction ──────────────────────────
+    //
+    // These two paths are the ONLY things keeping the task table bounded. If
+    // either silently stops working the manager grows without limit for the
+    // life of the process, which no functional test would notice.
+
+    /// A terminal task past its TTL must be dropped.
+    #[tokio::test]
+    async fn prune_drops_terminal_tasks_past_the_ttl() {
+        let mut mgr = TaskManager::new();
+        mgr.insert("old".into(), managed(TaskStatus::Working));
+        mgr.transition("old", TaskStatus::Completed);
+        backdate_terminal(&mut mgr, "old", TASK_TTL_MS + 1_000);
+
+        mgr.prune_expired();
+
+        assert!(
+            mgr.task_info("old").is_err(),
+            "a terminal task older than the TTL must be pruned"
+        );
+    }
+
+    /// Pruning must NOT take tasks that are still inside the TTL, or a client
+    /// polling `tasks/result` would lose a result it is entitled to.
+    #[tokio::test]
+    async fn prune_keeps_terminal_tasks_inside_the_ttl() {
+        let mut mgr = TaskManager::new();
+        mgr.insert("fresh".into(), managed(TaskStatus::Working));
+        mgr.transition("fresh", TaskStatus::Completed);
+        backdate_terminal(&mut mgr, "fresh", TASK_TTL_MS / 2);
+
+        mgr.prune_expired();
+
+        assert!(
+            mgr.task_info("fresh").is_ok(),
+            "a terminal task still inside the TTL must be kept"
+        );
+    }
+
+    /// Pruning must never touch a RUNNING task, however old. A long scan has no
+    /// `terminal_at_ms`, and dropping it would orphan the worker.
+    #[tokio::test]
+    async fn prune_never_drops_a_running_task() {
+        let mut mgr = TaskManager::new();
+        mgr.insert("busy".into(), managed(TaskStatus::Working));
+
+        mgr.prune_expired();
+
+        assert!(
+            mgr.task_info("busy").is_ok(),
+            "a Working task has no TTL clock and must survive pruning"
+        );
+    }
+
+    /// At `MAX_TRACKED_TASKS`, admitting one more must evict the OLDEST
+    /// terminal task — insertion order is what makes that well-defined.
+    #[tokio::test]
+    async fn admit_evicts_the_oldest_terminal_task_when_full() {
+        let mut mgr = TaskManager::new();
+        for i in 0..MAX_TRACKED_TASKS {
+            let id = format!("t{i}");
+            mgr.insert(id.clone(), managed(TaskStatus::Working));
+            mgr.transition(&id, TaskStatus::Completed);
+        }
+        assert_eq!(mgr.tasks.len(), MAX_TRACKED_TASKS);
+
+        mgr.admit().expect("terminal tasks don't block admission");
+
+        assert!(
+            mgr.tasks.len() < MAX_TRACKED_TASKS,
+            "admitting at capacity must free a slot"
+        );
+        assert!(
+            mgr.task_info("t0").is_err(),
+            "the OLDEST terminal task must be the one evicted"
+        );
+        assert!(
+            mgr.task_info("t1").is_ok(),
+            "eviction must take exactly one task"
+        );
+    }
+
+    /// Eviction must prefer terminal tasks and leave running ones alone, even
+    /// when a running task is older — killing live work to make room would lose
+    /// a result the caller is still waiting on.
+    #[tokio::test]
+    async fn eviction_spares_running_tasks_even_when_they_are_oldest() {
+        let mut mgr = TaskManager::new();
+        // Oldest first: one running, then terminal tasks filling the table.
+        mgr.insert("running-oldest".into(), managed(TaskStatus::Working));
+        for i in 0..MAX_TRACKED_TASKS - 1 {
+            let id = format!("done{i}");
+            mgr.insert(id.clone(), managed(TaskStatus::Completed));
+            mgr.transition(&id, TaskStatus::Failed);
+        }
+        assert_eq!(mgr.tasks.len(), MAX_TRACKED_TASKS);
+
+        mgr.admit().expect("only one task is running");
+
+        assert!(
+            mgr.task_info("running-oldest").is_ok(),
+            "a RUNNING task must never be evicted, even as the oldest entry"
+        );
+        assert!(
+            mgr.task_info("done0").is_err(),
+            "the oldest TERMINAL task must be evicted instead"
+        );
+    }
+
     /// `transition` must report a change EXACTLY once — the caller pushes a
     /// `notifications/tasks/status` off the return value, so a repeat would
     /// duplicate the notification and a miss would lose it.
