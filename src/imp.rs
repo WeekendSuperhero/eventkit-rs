@@ -374,6 +374,41 @@ pub struct RecurrenceRule {
     pub set_positions: Option<Vec<i32>>,
 }
 
+/// How long a blocking bridge waits for an EventKit completion block.
+///
+/// Every condvar wait in this file parks a thread until an Obj-C completion
+/// block fires. Unbounded, that is a permanent thread wedge whenever the block
+/// never arrives — and the MCP server runs these on tokio worker threads it
+/// cannot spare, so a wedged wait removes a worker from the pool for the life
+/// of the process. Bounding it turns "the server silently stopped answering"
+/// into an error the caller can see and retry.
+const COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Authorization gets a longer budget than data calls: it waits on a HUMAN
+/// dismissing the TCC consent dialog, not on the framework. Still bounded — a
+/// process that can never show a dialog (headless, no TCC grant, no GUI
+/// session) would otherwise leave `requestFullAccessTo*` outstanding forever.
+const AUTHORIZATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Park until a completion block fills the slot, or `timeout` elapses.
+///
+/// Returns `false` on timeout, leaving the slot untouched so the caller decides
+/// which error to report. The loop is required because a condvar may wake
+/// spuriously.
+fn wait_for_completion<T>(
+    cvar: &Condvar,
+    guard: &mut parking_lot::MutexGuard<'_, Option<T>>,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while guard.is_none() {
+        if cvar.wait_until(guard, deadline).timed_out() {
+            return false;
+        }
+    }
+    true
+}
+
 /// A thread's cached `EKEventStore` plus the authorization status last
 /// observed through it.
 ///
@@ -558,8 +593,10 @@ impl RemindersManager {
 
         let (lock, cvar) = &*result;
         let mut res = lock.lock();
-        while res.is_none() {
-            cvar.wait(&mut res);
+        if !wait_for_completion(cvar, &mut res, AUTHORIZATION_TIMEOUT) {
+            return Err(RemindersError::AuthorizationRequestFailed(
+                "timed out waiting for the system authorization response".to_string(),
+            ));
         }
 
         match res.take() {
@@ -727,8 +764,10 @@ impl RemindersManager {
 
         let (lock, cvar) = &*result;
         let mut guard = lock.lock();
-        while guard.is_none() {
-            cvar.wait(&mut guard);
+        if !wait_for_completion(cvar, &mut guard, COMPLETION_TIMEOUT) {
+            return Err(RemindersError::FetchFailed(
+                "timed out waiting for EventKit to return reminders".to_string(),
+            ));
         }
 
         guard
@@ -844,8 +883,10 @@ impl RemindersManager {
 
         let (lock, cvar) = &*result;
         let mut guard = lock.lock();
-        while guard.is_none() {
-            cvar.wait(&mut guard);
+        if !wait_for_completion(cvar, &mut guard, COMPLETION_TIMEOUT) {
+            return Err(RemindersError::FetchFailed(
+                "timed out waiting for EventKit to return reminders".to_string(),
+            ));
         }
         guard
             .take()
@@ -2571,8 +2612,10 @@ impl EventsManager {
 
         let (lock, cvar) = &*result;
         let mut res = lock.lock();
-        while res.is_none() {
-            cvar.wait(&mut res);
+        if !wait_for_completion(cvar, &mut res, AUTHORIZATION_TIMEOUT) {
+            return Err(EventKitError::AuthorizationRequestFailed(
+                "timed out waiting for the system authorization response".to_string(),
+            ));
         }
 
         match res.take() {

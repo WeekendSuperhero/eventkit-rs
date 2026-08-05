@@ -3094,7 +3094,12 @@ impl rmcp::ServerHandler for EventKitServer {
         request: CancelTaskParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CancelTaskResult, McpError> {
-        let task = self.task_manager.lock().cancel_task(&request.task_id)?;
+        // The lock is released at the end of this statement, BEFORE the abort
+        // below — see `TaskManager::cancel_task` for why that ordering matters.
+        let (task, aborted) = self.task_manager.lock().cancel_task(&request.task_id)?;
+        if let Some(handle) = aborted {
+            handle.abort();
+        }
         // Push the cancellation too — a client awaiting this task should learn
         // from the notification stream, not only from the reply to its own call.
         let notification = ServerNotification::TaskStatusNotification(TaskStatusNotification::new(

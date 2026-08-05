@@ -185,7 +185,9 @@ pub(super) struct ManagedTask {
     pub(super) meta: Task,
     pub(super) completion: Arc<TaskCompletion>,
     pub(super) cancel: CancellationToken,
-    pub(super) handle: JoinHandle<()>,
+    /// `None` once [`TaskManager::cancel_task`] has handed it out to be
+    /// aborted — see the re-entrancy note there.
+    pub(super) handle: Option<JoinHandle<()>>,
     /// When this task reached a terminal state, for TTL pruning.
     terminal_at_ms: Option<u64>,
 }
@@ -204,7 +206,7 @@ impl ManagedTask {
             meta,
             completion,
             cancel,
-            handle,
+            handle: Some(handle),
             terminal_at_ms: None,
         }
     }
@@ -318,26 +320,35 @@ impl TaskManager {
 
     /// Cancel a task: signal the worker, publish a cancelled result so any
     /// waiter unblocks, and mark it terminal.
-    pub(super) fn cancel_task(&mut self, task_id: &str) -> Result<Task, McpError> {
+    ///
+    /// Returns the worker's handle so the CALLER can abort it **after dropping
+    /// the manager lock**. Aborting here would deadlock: `JoinHandle::abort` can
+    /// drop the future inline on the calling thread when the task is not
+    /// currently being polled, that drop runs [`TaskFailureGuard::drop`], and
+    /// the guard takes this same non-reentrant mutex. Handing the handle back is
+    /// the simplest way to keep the abort outside the critical section.
+    pub(super) fn cancel_task(
+        &mut self,
+        task_id: &str,
+    ) -> Result<(Task, Option<JoinHandle<()>>), McpError> {
         let entry = self
             .find_mut(task_id)
             .ok_or_else(|| Self::unknown(task_id))?;
         if entry.is_terminal() {
             // Already finished — cancelling is a no-op, not an error. Repeat
             // cancels are idempotent (see the tool's `idempotent_hint`).
-            return Ok(entry.meta.clone());
+            return Ok((entry.meta.clone(), None));
         }
         entry.cancel.cancel();
         entry.completion.cancel(task_id);
-        // Abort the worker too. The token asks it to stop COOPERATIVELY, which
-        // most EventKit work cannot honour — the objc calls are synchronous and
-        // never observe the token — so without this the future would keep
-        // running to completion after the caller was told it was cancelled.
-        entry.handle.abort();
         entry.meta.status = TaskStatus::Cancelled;
         entry.meta.last_updated_at = now_iso8601();
         entry.terminal_at_ms = Some(now_millis());
-        Ok(entry.meta.clone())
+        // The token asks the worker to stop COOPERATIVELY, which most EventKit
+        // work cannot honour — the objc calls are synchronous and never observe
+        // the token — so the caller must abort as well, or the future would run
+        // to completion after the caller was told it was cancelled.
+        Ok((entry.meta.clone(), entry.handle.take()))
     }
 
     /// One page of tasks, newest first.
@@ -412,8 +423,12 @@ mod tests {
         mgr.insert("t".into(), managed(TaskStatus::Working));
         let completion = mgr.completion("t").expect("task exists");
 
-        let cancelled = mgr.cancel_task("t").expect("cancel succeeds");
+        let (cancelled, aborted) = mgr.cancel_task("t").expect("cancel succeeds");
         assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert!(
+            aborted.is_some(),
+            "the worker handle must be handed back for the caller to abort"
+        );
 
         let result = completion
             .wait(&CancellationToken::new())
@@ -429,8 +444,12 @@ mod tests {
         let mut mgr = TaskManager::new();
         mgr.insert("t".into(), managed(TaskStatus::Working));
         mgr.cancel_task("t").expect("first cancel");
-        let second = mgr.cancel_task("t").expect("second cancel must not error");
+        let (second, aborted) = mgr.cancel_task("t").expect("second cancel must not error");
         assert_eq!(second.status, TaskStatus::Cancelled);
+        assert!(
+            aborted.is_none(),
+            "an already-terminal task has no handle left to abort"
+        );
     }
 
     /// A worker result must not overwrite a cancellation that already landed.

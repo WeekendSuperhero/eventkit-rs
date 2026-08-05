@@ -13,7 +13,8 @@
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 /// Path to the binary cargo built for the integration test.
@@ -25,7 +26,8 @@ fn bin_path() -> std::path::PathBuf {
 struct McpClient {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Lines pumped off the child's stdout by a reader thread. See `spawn`.
+    lines: Receiver<String>,
     next_id: i64,
 }
 
@@ -39,13 +41,39 @@ impl McpClient {
             .spawn()
             .expect("failed to spawn eventkit --mcp");
         let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let stdout = child.stdout.take().unwrap();
+
+        // Read on a separate thread and hand lines over a channel.
+        //
+        // `BufRead::read_line` cannot honour a deadline: it blocks until a line
+        // arrives, so a timeout checked around it only fires if the server is
+        // still TALKING. When the server goes SILENT — a wedged worker thread,
+        // a task that panicked and never reported — the read never returns and
+        // the deadline is never reached. That turned a 10s assertion into an
+        // opaque 60s harness kill with no message. `recv_timeout` on this side
+        // makes every timeout in this file real.
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { return };
+                if tx.send(line).is_err() {
+                    return; // client dropped
+                }
+            }
+        });
+
         Self {
             child,
             stdin,
-            stdout,
+            lines,
             next_id: 0,
         }
+    }
+
+    /// Next line from the server, or `None` once `deadline` passes.
+    fn next_line(&self, deadline: Instant) -> Option<String> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        self.lines.recv_timeout(remaining).ok()
     }
 
     fn send(&mut self, msg: &Value) {
@@ -58,14 +86,12 @@ impl McpClient {
     fn recv_response(&mut self, id: i64, timeout: Duration) -> Value {
         let deadline = Instant::now() + timeout;
         loop {
-            if Instant::now() >= deadline {
-                panic!("timed out waiting for response id={id}");
-            }
-            let mut line = String::new();
-            let n = self.stdout.read_line(&mut line).expect("read MCP stdout");
-            if n == 0 {
-                panic!("MCP server closed stdout before response id={id}");
-            }
+            let Some(line) = self.next_line(deadline) else {
+                panic!(
+                    "timed out after {timeout:?} waiting for response id={id} — \
+                     the server went silent or closed stdout"
+                );
+            };
             let v: Value = serde_json::from_str(line.trim())
                 .unwrap_or_else(|e| panic!("non-JSON line from MCP server: {line:?} ({e})"));
             if v.get("id").and_then(Value::as_i64) == Some(id) {
@@ -104,11 +130,8 @@ impl McpClient {
     /// Responses seen along the way are discarded.
     fn wait_for_notification(&mut self, method: &str, timeout: Duration) -> Option<Value> {
         let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            let mut line = String::new();
-            if self.stdout.read_line(&mut line).ok()? == 0 {
-                return None;
-            }
+        loop {
+            let line = self.next_line(deadline)?;
             let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
                 continue;
             };
@@ -116,7 +139,6 @@ impl McpClient {
                 return Some(v);
             }
         }
-        None
     }
 
     fn list_tools(&mut self) -> Vec<Value> {
@@ -176,6 +198,17 @@ fn mcp_auth_status_tool_is_registered() {
         names.contains(&"auth_status"),
         "auth_status not in tools/list. Got: {names:?}"
     );
+}
+
+/// Whether the SPAWNED SERVER has full Reminders access, asked over the
+/// protocol via `auth_status` (read-only, never fires a TCC dialog).
+///
+/// Reading `RemindersManager::authorization_status()` from the test process
+/// would answer the wrong question: TCC grants attach to a binary's identity,
+/// and the test binary is not the `eventkit` binary under test.
+fn server_has_full_access(c: &mut McpClient) -> bool {
+    let resp = c.call_tool("auth_status", json!({}));
+    resp["result"]["structuredContent"]["reminders"] == "FullAccess"
 }
 
 #[test]
@@ -431,13 +464,27 @@ fn mcp_task_roundtrip_emits_status_notification() {
     let mut c = McpClient::spawn();
     c.initialize();
 
+    // Skip unless the SERVER has full access.
+    //
+    // This used to claim it worked on an unauthorized host too — "the tool
+    // fails inside the worker, the task goes to failed, and the push still
+    // fires". That was wrong, and it is what wedged CI: with the status
+    // `NotDetermined`, `search` does not fail, it calls `request_access` and
+    // parks the worker on the TCC consent dialog. A headless runner can never
+    // dismiss that dialog, so the worker never reported, no status was ever
+    // pushed, and the test sat until the harness killed it.
+    //
+    // The authorization state must be read from the SERVER, not from this test
+    // process: TCC identity is per-binary, so the test binary's own grant says
+    // nothing about the spawned `eventkit --mcp`.
+    if !server_has_full_access(&mut c) {
+        eprintln!("SKIP: the eventkit server lacks Full Access on this host");
+        return;
+    }
+
     // MUST be a tool that DECLARES taskSupport — rmcp rejects task-augmenting
     // one that doesn't ("Tool does not support task-based invocation"), which
     // is the correct advertised==invokable behaviour. `search` is declared.
-    //
-    // Works on an unauthorized host too: the tool fails inside the worker, the
-    // task goes to `failed`, and the status push still fires — which is the
-    // property under test.
     let created = c.request(
         "tools/call",
         json!({
