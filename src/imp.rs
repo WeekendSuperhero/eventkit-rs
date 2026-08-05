@@ -4046,6 +4046,34 @@ mod tests {
         );
     }
 
+    /// EXACTLY ONE place in this file may construct a store.
+    ///
+    /// This guards the outage that shipped before the cache existed: both
+    /// manager constructors built a store unconditionally, and `mcp.rs` builds a
+    /// manager per tool call, so a busy session allocated one store per call
+    /// until the calendar daemon cut the process off with
+    /// `EKCADErrorDomain 1021 — "This process has too many EKEventStore
+    /// instances. Use fewer event stores."`
+    ///
+    /// The fix routes every construction through `StoreCache::build`, behind the
+    /// per-thread caches. A second construction site anywhere in this file would
+    /// quietly restore the old behaviour, and no behavioural test would notice:
+    /// exhaustion needs enough LIVE stores to trip a process-wide daemon limit,
+    /// which no unit test creates and CI would never reach. The source itself is
+    /// the only thing that can be asserted on cheaply.
+    ///
+    /// The needle is split so this test cannot match itself.
+    #[test]
+    fn only_one_place_constructs_a_store() {
+        let needle = concat!("EKEventStore", "::new()");
+        let hits = include_str!("imp.rs").matches(needle).count();
+        assert_eq!(
+            hits, 1,
+            "expected exactly ONE construction site (StoreCache::build), found {hits}. \
+             Every store must come from the per-thread cache — see StoreCache."
+        );
+    }
+
     /// The write-only error text must name FULL access — the app surfaces this
     /// string, and "denied" would send the user to the wrong remedy.
     #[test]

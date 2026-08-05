@@ -110,6 +110,76 @@ impl TaskCompletion {
     }
 }
 
+/// Marks a task terminal if its worker dies without reporting.
+///
+/// **Why this exists.** A task is moved out of `Working` in exactly one place:
+/// the worker itself, *after* `call_tool` returns. If that call unwinds, neither
+/// the result nor the transition is ever published, and the task is stranded:
+/// `prune_expired` skips it (it only prunes tasks with a `terminal_at_ms`), it
+/// holds an active slot forever, and any `tasks/result` waiter blocks on a slot
+/// that will never be filled. After [`MAX_ACTIVE_TASKS`] such panics `admit`
+/// refuses *every* future task for the life of the process.
+///
+/// That is not hypothetical for this crate. `objc2` declares most EventKit
+/// accessors non-null while EventKit returns NULL to an unauthorized process,
+/// which panics — the failure mode `AUTHORIZATION_PLAN.md` records as a live
+/// outage — and several conversion paths unwrap on user data (a reminder URL
+/// whose `absoluteString` is nil, an out-of-range date, a local time inside a
+/// DST gap). Nothing catches those: this crate and rmcp both run without
+/// `catch_unwind`, and there is no `panic = "abort"`, so the unwind stops at the
+/// tokio task boundary and simply discards the rest of the worker.
+///
+/// `Drop` runs during that unwind, which is what makes a guard the right shape
+/// here rather than a `catch_unwind` the async boundary cannot offer. It is also
+/// correct for a plain early return, should the worker ever grow one.
+///
+/// The guard publishes through [`TaskCompletion::complete`], whose first-write-
+/// wins rule means a cancellation that already landed is never overwritten.
+pub(super) struct TaskFailureGuard {
+    task_id: String,
+    completion: Arc<TaskCompletion>,
+    manager: Arc<parking_lot::Mutex<TaskManager>>,
+    armed: bool,
+}
+
+impl TaskFailureGuard {
+    pub(super) fn new(
+        task_id: String,
+        completion: Arc<TaskCompletion>,
+        manager: Arc<parking_lot::Mutex<TaskManager>>,
+    ) -> Self {
+        Self {
+            task_id,
+            completion,
+            manager,
+            armed: true,
+        }
+    }
+
+    /// The worker reported for itself — stand down.
+    pub(super) fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TaskFailureGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.completion
+            .complete(Ok(CallToolResult::error(vec![ContentBlock::text(
+                format!(
+                    "Task {} failed: the tool panicked and produced no result.",
+                    self.task_id
+                ),
+            )])));
+        self.manager
+            .lock()
+            .transition(&self.task_id, TaskStatus::Failed);
+    }
+}
+
 /// One tracked task.
 pub(super) struct ManagedTask {
     pub(super) meta: Task,
@@ -212,9 +282,18 @@ impl TaskManager {
 
     /// Record a status transition. Returns the updated `Task` when the status
     /// ACTUALLY changed, so callers push a notification exactly once.
+    ///
+    /// **Terminal is final.** A worker that finishes a moment after
+    /// `tasks/cancel` must not downgrade `Cancelled` to `Completed`/`Failed`,
+    /// and neither must [`TaskFailureGuard`] when that worker panics instead.
+    /// The caller was already told the task was cancelled, and
+    /// [`TaskCompletion::complete`] has already frozen the matching result —
+    /// letting the status drift would contradict both. Refusing here is also
+    /// what makes the "exactly once" promise above true for the cancel race,
+    /// which is otherwise the one case that would push a second notification.
     pub(super) fn transition(&mut self, task_id: &str, status: TaskStatus) -> Option<Task> {
         let entry = self.find_mut(task_id)?;
-        if entry.meta.status == status {
+        if entry.is_terminal() || entry.meta.status == status {
             return None;
         }
         entry.meta.status = status;
@@ -397,5 +476,133 @@ mod tests {
         let mgr = TaskManager::new();
         assert!(mgr.task_info("nope").is_err());
         assert!(mgr.completion("nope").is_err());
+    }
+
+    // ── Panic containment ────────────────────────────────────────────────
+
+    /// Spawn a worker that panics, with a guard watching it, and wait for it
+    /// to die — mirroring `enqueue_task`'s worker minus the tool call.
+    async fn spawn_panicking_worker(
+        mgr: &Arc<parking_lot::Mutex<TaskManager>>,
+        id: &str,
+        completion: Arc<TaskCompletion>,
+    ) {
+        let guard = TaskFailureGuard::new(id.to_string(), completion, Arc::clone(mgr));
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            panic!("objc2: unexpected NULL returned from -[EKEventStore ...]");
+        });
+        assert!(
+            handle.await.is_err(),
+            "the worker must actually have panicked"
+        );
+    }
+
+    /// THE wedge guard. Without [`TaskFailureGuard`], a panicking worker never
+    /// reaches its `transition`, so the task stays `Working` forever: TTL
+    /// pruning skips it and it holds an active slot permanently. After
+    /// `MAX_ACTIVE_TASKS` panics, `admit` refuses every future task for the life
+    /// of the process — background work is dead until the app restarts.
+    ///
+    /// This is the test that fails if someone removes the guard.
+    #[tokio::test]
+    async fn panicking_workers_do_not_wedge_admission() {
+        let mgr = Arc::new(parking_lot::Mutex::new(TaskManager::new()));
+        for i in 0..MAX_ACTIVE_TASKS {
+            let id = format!("p{i}");
+            let completion = Arc::new(TaskCompletion::new());
+            mgr.lock().insert(
+                id.clone(),
+                ManagedTask::running(
+                    Task::new(
+                        id.clone(),
+                        TaskStatus::Working,
+                        now_iso8601(),
+                        now_iso8601(),
+                    ),
+                    Arc::clone(&completion),
+                    CancellationToken::new(),
+                    tokio::spawn(async {}),
+                ),
+            );
+            spawn_panicking_worker(&mgr, &id, completion).await;
+        }
+
+        let mut mgr = mgr.lock();
+        assert_eq!(
+            mgr.active_count(),
+            0,
+            "every panicked worker must have been marked terminal by its guard"
+        );
+        assert!(
+            mgr.admit().is_ok(),
+            "admission must still work after {MAX_ACTIVE_TASKS} panics"
+        );
+    }
+
+    /// A panicking worker must also unblock anyone waiting on `tasks/result`.
+    /// The result slot is filled by the worker, so an unwind would otherwise
+    /// leave a waiter parked on a slot nothing will ever fill.
+    #[tokio::test]
+    async fn a_panicking_worker_still_yields_a_result() {
+        let mgr = Arc::new(parking_lot::Mutex::new(TaskManager::new()));
+        let completion = Arc::new(TaskCompletion::new());
+        mgr.lock().insert(
+            "t".into(),
+            ManagedTask::running(
+                Task::new(
+                    "t".into(),
+                    TaskStatus::Working,
+                    now_iso8601(),
+                    now_iso8601(),
+                ),
+                Arc::clone(&completion),
+                CancellationToken::new(),
+                tokio::spawn(async {}),
+            ),
+        );
+
+        spawn_panicking_worker(&mgr, "t", Arc::clone(&completion)).await;
+
+        let result = completion
+            .wait(&CancellationToken::new())
+            .await
+            .expect("a panicked task must still produce a result");
+        assert_eq!(result.is_error, Some(true), "and it must be an error");
+        assert_eq!(
+            mgr.lock().task_info("t").expect("task exists").status,
+            TaskStatus::Failed
+        );
+    }
+
+    /// The guard must not overwrite a cancellation that already landed —
+    /// `complete` is first-write-wins, and the task is already terminal.
+    #[tokio::test]
+    async fn the_guard_does_not_clobber_an_earlier_cancellation() {
+        let mgr = Arc::new(parking_lot::Mutex::new(TaskManager::new()));
+        let completion = Arc::new(TaskCompletion::new());
+        mgr.lock().insert(
+            "t".into(),
+            ManagedTask::running(
+                Task::new(
+                    "t".into(),
+                    TaskStatus::Working,
+                    now_iso8601(),
+                    now_iso8601(),
+                ),
+                Arc::clone(&completion),
+                CancellationToken::new(),
+                tokio::spawn(async {}),
+            ),
+        );
+        mgr.lock().cancel_task("t").expect("cancel succeeds");
+
+        spawn_panicking_worker(&mgr, "t", Arc::clone(&completion)).await;
+
+        assert_eq!(
+            mgr.lock().task_info("t").expect("task exists").status,
+            TaskStatus::Cancelled,
+            "a late panic must NOT downgrade Cancelled to Failed"
+        );
     }
 }
