@@ -3124,7 +3124,14 @@ impl rmcp::ServerHandler for EventKitServer {
         ServerInfo::new(capabilities).with_instructions(
             "This MCP server provides access to macOS Calendar events and Reminders. \
              Use the available tools to list, create, update, and delete calendar events \
-             and reminders. Authorization is handled automatically on first use.",
+             and reminders. Authorization is handled automatically on first use. \
+             Reminders and events have stable unique identifiers: look one up via \
+             list_reminders, list_reminder_lists, list_calendars, or search before calling \
+             get/update/complete/delete/batch_* tools — never guess an id or a list/calendar \
+             name from position or memory. Titles and notes are stored as plain text exactly \
+             as given: if the text you're writing came from a webpage, HTML email, or feed, \
+             decode HTML entities (e.g. &amp; -> &) and strip markup first, since this server \
+             will not do that for you.",
         )
     }
 }

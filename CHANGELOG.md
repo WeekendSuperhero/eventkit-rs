@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **MCP server instructions** — `get_info()`'s `instructions` string now also tells clients to look up ids via `list_reminders`/`list_reminder_lists`/`list_calendars`/`search` rather than guessing them, and that titles/notes are stored as plain text verbatim (decode HTML entities and strip markup before writing content sourced from a webpage/email/feed — the server does not do this for you). This is the one piece of guidance every MCP-spec-compliant client sees automatically at connect time regardless of whether it also supports Skills.
+
 ## [0.6.0] - 2026-08-04
 
 Versions 0.3.0 through 0.5.x shipped without changelog entries; their changes are
