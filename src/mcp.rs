@@ -95,6 +95,7 @@ struct BatchResponse {
     succeeded: usize,
     #[schemars(with = "i64")]
     failed: usize,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     errors: Vec<BatchItemError>,
 }
@@ -473,10 +474,13 @@ struct ReminderOutput {
     /// Parent reminder identifier when this is a subtask.
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_id: Option<String>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
     attachments_count: usize,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     alarms: Vec<AlarmOutput>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     recurrence_rules: Vec<RecurrenceRuleOutput>,
 }
@@ -565,10 +569,13 @@ struct EventOutput {
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     structured_location: Option<LocationOutput>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     alarms: Vec<AlarmOutput>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     recurrence_rules: Vec<RecurrenceRuleOutput>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     attendees: Vec<AttendeeOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -586,6 +593,7 @@ struct EventOutput {
     /// the timezone applied to `start` / `end`.
     #[serde(skip_serializing_if = "Option::is_none")]
     timezone: Option<String>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
     attachments_count: usize,
 }
@@ -676,6 +684,7 @@ struct CalendarOutput {
     /// subset of `["busy", "free", "tentative", "unavailable"]`. Empty
     /// when the calendar holds reminders only, or for source backends that
     /// report `EKCalendarEventAvailabilityNone`.
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     supported_event_availabilities: Vec<String>,
 }

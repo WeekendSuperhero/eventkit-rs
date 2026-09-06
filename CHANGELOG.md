@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`outputSchema` claimed fields the server didn't send** — `attachments_count`/`alarms`/`recurrence_rules` on reminders and events, `attendees` on events, `errors` on batch responses, and `supported_event_availabilities` on calendars all used `#[serde(skip_serializing_if = ...)]` without the matching `#[serde(default)]`. `schemars` only treats a field as optional in the generated schema when a `default` is present, so it kept marking these `required` even though serde omitted them whenever empty/zero. Any host that validates `structuredContent` strictly against `outputSchema` (e.g. Claude Desktop) rejected every `list_reminders`, `list_reminder_lists`, `search`, and `batch_*` call as malformed data as soon as one item lacked alarms/recurrence/attachments. Added `#[serde(default)]` alongside each `skip_serializing_if` so the declared schema matches actual output.
+
 ## [0.6.0] - 2026-08-04
 
 Versions 0.3.0 through 0.5.x shipped without changelog entries; their changes are
